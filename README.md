@@ -8,9 +8,9 @@ A feature-rich, professional SQL query editor powered by **DuckDB** with AI assi
 
 ## ✨ Features
 
-# SimpliSQL V1
+# SimpliSQL V2
 
-SimpliSQL V1 is a desktop DuckDB workbench built with PyQt6. It focuses on local file analytics, SQL authoring, workflow-style data operations, export/audit support, and a local AI assistant for DuckDB SQL generation.
+SimpliSQL V2 is a desktop DuckDB workbench built with PyQt6. It focuses on local file analytics, SQL authoring, workflow-style data operations, export/audit support, and a local AI assistant for DuckDB SQL generation.
 
 ## What it does
 
