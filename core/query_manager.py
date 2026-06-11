@@ -19,6 +19,7 @@ import uuid
 import hashlib
 import getpass
 import platform
+import logging
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit,
@@ -31,6 +32,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib import colors
+
+logger = logging.getLogger(__name__)
 
 
 def get_system_ip():
@@ -121,10 +124,6 @@ def generate_audit_pdf(pdf_path, query_text, summary_data):
             ['App Version', summary_data.get('App Version', 'N/A')],
             ['Query SHA256', summary_data.get('Query SHA256', 'N/A')],
             ['CSV SHA256', summary_data.get('CSV SHA256', 'N/A')],
-            ['Audit Log', summary_data.get('Audit Log', 'N/A')],
-            ['Audit Record Hash', summary_data.get('Audit Record Hash', 'N/A')],
-            ['Audit Link File', summary_data.get('Audit Link File', 'N/A')],
-            ['PDF Report', summary_data.get('PDF Report', 'N/A')]
         ]
         
         summary_table = Table(summary_table_data, colWidths=[2*inch, 4.5*inch])
@@ -300,6 +299,452 @@ class QueryManager:
         )
 
         return sql
+
+    def _extract_cte_names_sqlaware(self, sql: str) -> set[str]:
+        names = set()
+        if not sql:
+            return names
+        for cte in re.findall(r"(?i)(?:WITH|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql):
+            names.add(cte.lower())
+        return names
+
+    def _resolve_uploaded_table_sources(self) -> dict[str, str]:
+        """Resolve uploaded display names to existing parquet paths, with a few local fallbacks."""
+        table_sources: dict[str, str] = {}
+        display_names = getattr(self, "uploaded_display_names", []) or []
+        doc_dir = getattr(self, "doc_dir", "") or ""
+
+        candidate_dirs = []
+        if doc_dir:
+            candidate_dirs.append(doc_dir)
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(current_dir, "..", "..", ".."))
+        candidate_dirs.extend([
+            os.path.join(repo_root, "utils", "ParquetFiles"),
+            os.path.join(repo_root, ".venv", "V1", "utils", "ParquetFiles"),
+            os.path.join(repo_root, "dist", "SimpliSQL", "_internal", "utils", "ParquetFiles"),
+            os.path.join(repo_root, ".venv", "V1", "dist", "SimpliSQL", "_internal", "utils", "ParquetFiles"),
+        ])
+
+        seen = set()
+        normalized_dirs = []
+        for path in candidate_dirs:
+            if not path:
+                continue
+            norm = os.path.abspath(path)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            normalized_dirs.append(norm)
+
+        for name in display_names:
+            str_name = str(name)
+            resolved_path = None
+            for base_dir in normalized_dirs:
+                candidate = os.path.join(base_dir, f"{str_name}.parquet")
+                if os.path.exists(candidate):
+                    resolved_path = candidate.replace("\\", "/")
+                    break
+            if resolved_path is None and normalized_dirs:
+                resolved_path = os.path.join(normalized_dirs[0], f"{str_name}.parquet").replace("\\", "/")
+            if resolved_path:
+                table_sources[str_name.lower()] = resolved_path
+
+        return table_sources
+
+    def _find_matching_paren_sqlaware(self, sql: str, open_idx: int) -> int:
+        """Return the matching ')' index for '(' at open_idx, or -1 if not found safely."""
+        if open_idx < 0 or open_idx >= len(sql) or sql[open_idx] != "(":
+            return -1
+
+        depth = 1
+        in_single = False
+        in_double = False
+        i = open_idx + 1
+
+        while i < len(sql):
+            ch = sql[i]
+            nxt = sql[i + 1] if i + 1 < len(sql) else ""
+
+            if in_single:
+                if ch == "'" and nxt == "'":
+                    i += 2
+                    continue
+                if ch == "'":
+                    in_single = False
+                i += 1
+                continue
+
+            if in_double:
+                if ch == '"' and nxt == '"':
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+
+            if ch == "-" and nxt == "-":
+                nl = sql.find("\n", i + 2)
+                i = len(sql) if nl == -1 else nl + 1
+                continue
+
+            if ch == "/" and nxt == "*":
+                end = sql.find("*/", i + 2)
+                i = len(sql) if end == -1 else end + 2
+                continue
+
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+
+        return -1
+
+    def _extract_cte_body_spans_sqlaware(self, sql: str) -> tuple[list[tuple[int, int]], int]:
+        """Return [(body_start, body_end), ...] for WITH CTE bodies and the main-query start."""
+        spans: list[tuple[int, int]] = []
+        if not sql or not re.match(r"(?is)^\s*WITH\b", sql):
+            return spans, 0
+
+        n = len(sql)
+        i = 0
+
+        def skip_ws_and_comments(pos: int) -> int:
+            while pos < n:
+                ch = sql[pos]
+                nxt = sql[pos + 1] if pos + 1 < n else ""
+                if ch.isspace():
+                    pos += 1
+                    continue
+                if ch == "-" and nxt == "-":
+                    nl = sql.find("\n", pos + 2)
+                    pos = n if nl == -1 else nl + 1
+                    continue
+                if ch == "/" and nxt == "*":
+                    end = sql.find("*/", pos + 2)
+                    pos = n if end == -1 else end + 2
+                    continue
+                break
+            return pos
+
+        m = re.match(r"(?is)\s*WITH\b(?:\s+RECURSIVE\b)?", sql)
+        if not m:
+            return spans, 0
+        i = m.end()
+
+        while i < n:
+            i = skip_ws_and_comments(i)
+            if i >= n:
+                break
+
+            if sql[i] == '"':
+                end = i + 1
+                while end < n:
+                    if sql[end] == '"' and end + 1 < n and sql[end + 1] == '"':
+                        end += 2
+                        continue
+                    if sql[end] == '"':
+                        end += 1
+                        break
+                    end += 1
+                i = end
+            else:
+                start = i
+                while i < n and (sql[i].isalnum() or sql[i] == "_"):
+                    i += 1
+                if i == start:
+                    return spans, skip_ws_and_comments(start)
+
+            i = skip_ws_and_comments(i)
+            if i < n and sql[i] == "(":
+                close_cols = self._find_matching_paren_sqlaware(sql, i)
+                if close_cols == -1:
+                    return spans, skip_ws_and_comments(i)
+                i = close_cols + 1
+                i = skip_ws_and_comments(i)
+
+            if sql[i:i + 2].upper() != "AS":
+                return spans, skip_ws_and_comments(i)
+            i += 2
+            i = skip_ws_and_comments(i)
+            if i >= n or sql[i] != "(":
+                return spans, skip_ws_and_comments(i)
+
+            body_open = i
+            body_close = self._find_matching_paren_sqlaware(sql, body_open)
+            if body_close == -1:
+                return spans, skip_ws_and_comments(i)
+
+            spans.append((body_open + 1, body_close))
+            i = body_close + 1
+            i = skip_ws_and_comments(i)
+            if i < n and sql[i] == ",":
+                i += 1
+                continue
+            return spans, i
+
+        return spans, i
+
+    def _rewrite_table_references_in_scope(
+        self,
+        sql: str,
+        table_sources: dict[str, str],
+        cte_names: set[str],
+    ) -> str:
+        """Rewrite only top-level physical FROM/JOIN table refs within a SQL scope."""
+        if not sql:
+            return sql
+
+        result = []
+        i = 0
+        n = len(sql)
+        depth = 0
+
+        def keyword_at(pos: int, keyword: str) -> bool:
+            end = pos + len(keyword)
+            if end > n or sql[pos:end].upper() != keyword:
+                return False
+            prev = sql[pos - 1] if pos > 0 else ""
+            nxt = sql[end] if end < n else ""
+            if prev and (prev.isalnum() or prev == "_"):
+                return False
+            if nxt and (nxt.isalnum() or nxt == "_"):
+                return False
+            return True
+
+        while i < n:
+            ch = sql[i]
+            nxt = sql[i + 1] if i + 1 < n else ""
+
+            if ch == "'":
+                start = i
+                i += 1
+                while i < n:
+                    if sql[i] == "'" and i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    if sql[i] == "'":
+                        i += 1
+                        break
+                    i += 1
+                result.append(sql[start:i])
+                continue
+
+            if ch == '"':
+                start = i
+                i += 1
+                while i < n:
+                    if sql[i] == '"' and i + 1 < n and sql[i + 1] == '"':
+                        i += 2
+                        continue
+                    if sql[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                result.append(sql[start:i])
+                continue
+
+            if ch == "-" and nxt == "-":
+                start = i
+                nl = sql.find("\n", i + 2)
+                i = n if nl == -1 else nl + 1
+                result.append(sql[start:i])
+                continue
+
+            if ch == "/" and nxt == "*":
+                start = i
+                end = sql.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+                result.append(sql[start:i])
+                continue
+
+            if ch == "(":
+                depth += 1
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == ")":
+                depth = max(depth - 1, 0)
+                result.append(ch)
+                i += 1
+                continue
+
+            if depth > 0:
+                result.append(ch)
+                i += 1
+                continue
+
+            matched_keyword = None
+            for keyword in ("FROM", "JOIN"):
+                if keyword_at(i, keyword):
+                    matched_keyword = keyword
+                    break
+
+            if not matched_keyword:
+                result.append(ch)
+                i += 1
+                continue
+
+            kw_end = i + len(matched_keyword)
+            result.append(sql[i:kw_end])
+            i = kw_end
+
+            while i < n:
+                ch = sql[i]
+                nxt = sql[i + 1] if i + 1 < n else ""
+                if ch.isspace():
+                    result.append(ch)
+                    i += 1
+                    continue
+                if ch == "-" and nxt == "-":
+                    start = i
+                    nl = sql.find("\n", i + 2)
+                    i = n if nl == -1 else nl + 1
+                    result.append(sql[start:i])
+                    continue
+                if ch == "/" and nxt == "*":
+                    start = i
+                    end = sql.find("*/", i + 2)
+                    i = n if end == -1 else end + 2
+                    result.append(sql[start:i])
+                    continue
+                break
+
+            if i >= n:
+                break
+
+            if sql[i] in "(\"'":
+                if sql[i] == "(":
+                    depth += 1
+                result.append(sql[i])
+                i += 1
+                continue
+
+            start = i
+            while i < n and (sql[i].isalnum() or sql[i] == "_"):
+                i += 1
+            table_name = sql[start:i]
+            if not table_name:
+                result.append(sql[start:start + 1])
+                i = start + 1
+                continue
+
+            lowered = table_name.lower()
+            if lowered in cte_names or lowered not in table_sources:
+                result.append(table_name)
+                continue
+
+            lookahead = i
+            while lookahead < n and sql[lookahead].isspace():
+                lookahead += 1
+            if lookahead < n and sql[lookahead] == "(":
+                result.append(table_name)
+                continue
+
+            result.append(f"read_parquet('{table_sources[lowered]}')")
+
+        return "".join(result)
+
+    def _is_balanced_sql_parentheses(self, sql: str) -> bool:
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(sql):
+            ch = sql[i]
+            nxt = sql[i + 1] if i + 1 < len(sql) else ""
+            if in_single:
+                if ch == "'" and nxt == "'":
+                    i += 2
+                    continue
+                if ch == "'":
+                    in_single = False
+                i += 1
+                continue
+            if in_double:
+                if ch == '"' and nxt == '"':
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+            if ch == "-" and nxt == "-":
+                nl = sql.find("\n", i + 2)
+                i = len(sql) if nl == -1 else nl + 1
+                continue
+            if ch == "/" and nxt == "*":
+                end = sql.find("*/", i + 2)
+                i = len(sql) if end == -1 else end + 2
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+            i += 1
+        return depth == 0 and not in_single and not in_double
+
+    def _rewrite_physical_table_references(self, sql: str) -> str:
+        """Replace only physical FROM/JOIN table references using a lightweight SQL-aware scan."""
+        if not sql or "read_parquet(" in sql.lower():
+            return sql
+
+        table_sources = self._resolve_uploaded_table_sources()
+        if not table_sources:
+            return sql
+
+        cte_names = self._extract_cte_names_sqlaware(sql)
+        cte_body_spans, main_query_start = self._extract_cte_body_spans_sqlaware(sql)
+
+        if not cte_body_spans:
+            rewritten = self._rewrite_table_references_in_scope(sql, table_sources, cte_names)
+        else:
+            parts = []
+            cursor = 0
+            for body_start, body_end in cte_body_spans:
+                parts.append(sql[cursor:body_start])
+                parts.append(
+                    self._rewrite_table_references_in_scope(
+                        sql[body_start:body_end],
+                        table_sources,
+                        cte_names,
+                    )
+                )
+                cursor = body_end
+            parts.append(sql[cursor:main_query_start])
+            parts.append(
+                self._rewrite_table_references_in_scope(
+                    sql[main_query_start:],
+                    table_sources,
+                    cte_names,
+                )
+            )
+            rewritten = "".join(parts)
+
+        original_balanced = self._is_balanced_sql_parentheses(sql)
+        rewritten_balanced = self._is_balanced_sql_parentheses(rewritten)
+        if not rewritten_balanced:
+            if original_balanced:
+                logger.warning("DuckDB conversion skipped because rewritten SQL is unbalanced.")
+                return sql
+            logger.warning("Original SQL is unbalanced; preserving safe table rewrites only.")
+        return rewritten
     
     def execute_query(self):
         """Execute SQL query and display results"""
@@ -321,10 +766,6 @@ class QueryManager:
         # Remove trailing semicolons (DuckDB doesn't need them and they can cause issues)
         query = query.rstrip(';').strip()
         
-        self.arithmetic_pattern = (
-            r"(?i)\b(?!(?:select|from|where|group|order|join)\b)([\w\.]+)\s*([+\-*/])\s*([\w\.]+)"
-        )
-
         if not query:
             MainWindow.show_styled_message_box(self, "Warning", "SQL query cannot be empty!", icon=QMessageBox.Icon.Information)
             return
@@ -338,47 +779,7 @@ class QueryManager:
             return
 
         try:
-            cte_names = set()
-            cte_pattern = r"(?i)(?:WITH|,)\s+(\w+)\s+AS\s*\("
-            for cte in re.findall(cte_pattern, query):
-                cte_names.add(cte)
-
-            if "read_parquet(" in query.lower():
-                modified_query = query
-            else:
-                table_pattern = (
-                    r"(?si)\b(FROM|JOIN)\s+(\w+)"
-                    r"(?:\s+(?:AS\s+)?(?!JOIN\b|WHERE\b|ON\b|ORDER\b|GROUP\b|HAVING\b|LIMIT\b|"
-                    r"UNION\b|LEFT\b|RIGHT\b|INNER\b|OUTER\b|CROSS\b|FULL\b|QUALIFY\b|FILTER\b|EXCLUDE\b|REPLACE\b)(\w+))?"
-                    r"(?=\s|$)"
-                )
-
-                def table_replacer(m):
-                    keyword = m.group(1)
-                    table_name = m.group(2)
-                    alias = m.group(3) if m.group(3) else table_name
-                    if table_name in cte_names:
-                        return m.group(0)
-                    parquet_file = os.path.join(
-                        self.doc_dir, f"{table_name}.parquet"
-                    ).replace("\\", "/")
-                    # Quote the alias to handle table names starting with numbers or containing special characters
-                    quoted_alias = f'"{alias}"'
-                    return f"{keyword} (SELECT * FROM read_parquet('{parquet_file}')) AS {quoted_alias}"
-
-                modified_query = re.sub(table_pattern, table_replacer, query)
-
-            agg_pattern = r"(?i)\b(sum|avg|min|max|stddev|variance)\s*\(\s*([^\(\)]+)\s*\)"
-
-            def agg_replacer(match):
-                aggregator = match.group(1).strip().upper()
-                expression = match.group(2).strip()
-
-                if aggregator in ("MIN", "MAX") and "date" in expression.lower():
-                    return f"{aggregator}(TRY_CAST({expression} AS DATE))"
-                return f"{aggregator}(TRY_CAST({expression} AS DOUBLE))"
-
-            modified_query = re.sub(agg_pattern, agg_replacer, modified_query)
+            modified_query = self._rewrite_physical_table_references(query)
 
             datediff_pattern = (
                 r"(?i)\bDATEDIFF\s*\(\s*([A-Za-z]+)\s*,\s*([^,]+)\s*,\s*([^)]+)\)"
@@ -421,10 +822,6 @@ class QueryManager:
                 return f"EXTRACT('{datepart}' FROM CAST({date_expr} AS DATE))"
 
             modified_query = re.sub(extract_pattern, extract_replacer, modified_query)
-
-            modified_query = self.safe_arithmetic_replace(
-                modified_query, self.arithmetic_pattern, self.arithmetic_replacer
-            )
 
             # Normalize cross-dialect date/time patterns before execution.
             query = self._normalize_duckdb_datetime_sql(query)
@@ -503,15 +900,16 @@ class QueryManager:
                 
                 # Check for errors
                 if query_error[0]:
-                    # If both errors, show both
+                    # If both attempts fail, surface only the fallback error since
+                    # that is the final query form we actually rely on for execution.
                     if isinstance(query_error[0], tuple) and len(query_error[0]) == 2:
-                        e1, e2 = query_error[0]
-                        error_msg = f"<b>Original Query Error:</b><br>{e1}<br><br><b>Fallback (Parquet) Query Error:</b><br>{e2}"
+                        _e1, e2 = query_error[0]
+                        error_msg = f"<b>Fallback (Parquet) Query Error:</b><br>{e2}"
                         MainWindow.show_error_message_box_with_copy(
                             self,
                             "SQL Error",
                             error_msg,
-                            detailed_text=f"Original Query Error:\n{e1}\n\nFallback (Parquet) Query Error:\n{e2}"
+                            detailed_text=f"Fallback (Parquet) Query Error:\n{e2}"
                         )
                         progress.close()
                         return
@@ -644,12 +1042,7 @@ class QueryManager:
 
         return log_path, record_hash
 
-    def _write_run_to_store_link_file(self, csv_path: str, payload: dict) -> str:
-        """Write sidecar link file that ties CSV output to audit artifacts."""
-        link_path = os.path.splitext(csv_path)[0] + "_audit_link.json"
-        with open(link_path, "w", encoding="utf-8") as wf:
-            json.dump(payload, wf, indent=2, ensure_ascii=False)
-        return link_path
+    # Audit link file generation removed per user request.
 
     def execute_query_to_store(self):
         """Execute SQL query wrapped in COPY() to save results directly to CSV file"""
@@ -677,12 +1070,12 @@ class QueryManager:
         actor_user = getpass.getuser() if getpass.getuser() else "unknown"
         machine_name = socket.gethostname() or "unknown"
         system_ip = get_system_ip()
-        app_version = "SimpliSQL V1"
+        app_version = "SimpliSQL V2"
         host_platform = platform.platform()
         query_sha256 = _sha256_text(query)
 
         audit_stage = "initialized"
-        output_folder = ""
+        output_folder = ""  
         filename = ""
         csv_path = ""
         pdf_path = ""
@@ -757,35 +1150,7 @@ class QueryManager:
             csv_path = os.path.join(output_folder, f"{filename}.csv").replace("\\", "/")
             
             audit_stage = "rewrite_query"
-            # Apply same query transformations as execute_query
-            cte_names = set()
-            cte_pattern = r"(?i)(?:WITH|,)\s+(\w+)\s+AS\s*\("
-            for cte in re.findall(cte_pattern, query):
-                cte_names.add(cte)
-
-            if "read_parquet(" in query.lower():
-                modified_query = query
-            else:
-                table_pattern = (
-                    r"(?si)\b(FROM|JOIN)\s+(\w+)"
-                    r"(?:\s+(?:AS\s+)?(?!JOIN\b|WHERE\b|ON\b|ORDER\b|GROUP\b|HAVING\b|LIMIT\b|"
-                    r"UNION\b|LEFT\b|RIGHT\b|INNER\b|OUTER\b|CROSS\b|FULL\b|QUALIFY\b|FILTER\b|EXCLUDE\b|REPLACE\b)(\w+))?"
-                    r"(?=\s|$)"
-                )
-
-                def table_replacer(m):
-                    keyword = m.group(1)
-                    table_name = m.group(2)
-                    alias = m.group(3) if m.group(3) else table_name
-                    if table_name in cte_names:
-                        return m.group(0)
-                    parquet_file = os.path.join(
-                        self.doc_dir, f"{table_name}.parquet"
-                    ).replace("\\", "/")
-                    quoted_alias = f'"{alias}"'
-                    return f"{keyword} (SELECT * FROM read_parquet('{parquet_file}')) AS {quoted_alias}"
-
-                modified_query = re.sub(table_pattern, table_replacer, query)
+            modified_query = self._rewrite_physical_table_references(query)
 
             # Normalize cross-dialect date/time patterns for export path too.
             modified_query = self._normalize_duckdb_datetime_sql(modified_query)
@@ -922,62 +1287,11 @@ class QueryManager:
                 print(f"⚠️ Failed to append audit log record: {audit_err}")
                 audit_log_path, audit_record_hash = "", ""
 
-            audit_stage = "write_audit_link"
-            link_payload = {
-                "run_id": run_id,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "success",
-                "csv_path": csv_path,
-                "csv_sha256": csv_sha256,
-                "pdf_audit_path": pdf_path,
-                "pdf_audit_generated": False,
-                "audit_log": audit_log_path,
-                "audit_record_hash": audit_record_hash,
-                "query_sha256": query_sha256,
-                "executed_query_sha256": executed_query_sha256,
-            }
-            try:
-                link_path = self._write_run_to_store_link_file(csv_path, link_payload)
-            except Exception as link_err:
-                print(f"⚠️ Failed to write audit link sidecar: {link_err}")
-                link_path = ""
+            # Audit link file and related summary fields removed per user request.
 
-            summary_data['Audit Log'] = audit_log_path or 'unavailable'
-            summary_data['Audit Record Hash'] = audit_record_hash or 'unavailable'
-            summary_data['Audit Link File'] = link_path or 'unavailable'
-
-            # Generate PDF only after audit metadata is available,
-            # so the report contains real audit linkage values.
+            # Generate PDF only after audit metadata is available.
             audit_stage = "generate_pdf"
             pdf_success = generate_audit_pdf(pdf_path, query, summary_data)
-
-            # Update sidecar with final PDF generation status.
-            if link_path:
-                try:
-                    link_payload["pdf_audit_generated"] = bool(pdf_success)
-                    link_payload["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self._write_run_to_store_link_file(csv_path, link_payload)
-                except Exception as link_update_err:
-                    print(f"⚠️ Failed to update audit link sidecar status: {link_update_err}")
-
-            # Append a PDF generation status event to preserve full run chronology.
-            try:
-                self._append_run_to_store_audit({
-                    "event_type": "run_to_store_pdf",
-                    "status": "success" if pdf_success else "failed",
-                    "run_id": run_id,
-                    "stage": audit_stage,
-                    "actor_user": actor_user,
-                    "machine_name": machine_name,
-                    "system_ip": system_ip,
-                    "app_version": app_version,
-                    "host_platform": host_platform,
-                    "pdf_audit_path": pdf_path,
-                    "pdf_audit_generated": bool(pdf_success),
-                    "parent_run_record_hash": audit_record_hash,
-                })
-            except Exception as pdf_audit_err:
-                print(f"⚠️ Failed to append PDF audit status record: {pdf_audit_err}")
 
             # Also display summary in the table view
             import pandas as pd
@@ -990,7 +1304,6 @@ class QueryManager:
                 'Execution Time (s)': f"{elapsed_time:.2f}",
                 'Stored At': store_timestamp,
                 'Output Location': output_folder,
-                'Audit Record Hash': (audit_record_hash[:16] + '...') if audit_record_hash else 'unavailable',
             }])
             self.populate_treeview(summary_df, set_full=True)
             
@@ -1002,9 +1315,6 @@ class QueryManager:
                     f"Rows: {row_count}\n"
                     f"CSV File: {os.path.basename(csv_path)}\n"
                     f"PDF Audit: {pdf_filename}\n"
-                    f"Audit Log: {audit_log_path or 'unavailable'}\n"
-                    f"Audit Record Hash: {audit_record_hash or 'unavailable'}\n"
-                    f"Audit Link File: {os.path.basename(link_path) if link_path else 'unavailable'}\n"
                     f"Size: {file_size_mb:.2f} MB\n"
                     f"Time: {elapsed_time:.2f}s\n"
                     f"Stored At: {store_timestamp}\n"
@@ -1017,9 +1327,6 @@ class QueryManager:
                     f"Run ID: {run_id}\n"
                     f"Rows: {row_count}\n"
                     f"File: {os.path.basename(csv_path)}\n"
-                    f"Audit Log: {audit_log_path or 'unavailable'}\n"
-                    f"Audit Record Hash: {audit_record_hash or 'unavailable'}\n"
-                    f"Audit Link File: {os.path.basename(link_path) if link_path else 'unavailable'}\n"
                     f"Size: {file_size_mb:.2f} MB\n"
                     f"Time: {elapsed_time:.2f}s\n"
                     f"Stored At: {store_timestamp}\n"

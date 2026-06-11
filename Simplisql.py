@@ -35,7 +35,8 @@ from PyQt6.QtGui import QFont, QPalette, QColor, QKeySequence, QShortcut, QKeyEv
 from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QSize, QAbstractTableModel, QSortFilterProxyModel, QTimer
 
 # Import refactored modules
-from ai.ai_assistant_new import AIAssistantDialog
+from ai.ai_assistant_new import AIAssistantDialog, ModelLoaderThread
+from ai.local_model import LocalModelClient
 from ui import SearchDialog, CustomPlainTextEdit, WorkflowWizard, StepEditorDialog, DataOperationDialogs, ViewManager, UIBuilder
 from core import QueryManager, FileUtilities, FileUpload, QueryHelpers, WorkflowManager, ExportUtils
 from utils import (
@@ -55,6 +56,9 @@ except Exception:
     pass
 
 # Import mixins for data operations, view management, query execution, file utilities, file upload, UI builder, query helpers, workflows, and export
+
+SAFE_AI_CONFIG_KEYS = {"selected_provider", "default_model"}
+
 
 class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUtilities, FileUpload, UIBuilder, QueryHelpers, WorkflowManager, ExportUtils, QWidget):
     def __init__(self, parent=None, controller=None):
@@ -121,7 +125,11 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
         self.views = self.load_views()
 
         self.sql_text = QTextEdit()
+        self.ai_assistant_dialog = None
+        self.shared_ai_client = LocalModelClient()
+        self._ai_model_loader = None
         self.init_ui()
+        QTimer.singleShot(0, self._preload_ai_model)
 
     def _register_custom_functions(self):
         """Register custom SQL functions for use in DuckDB queries"""
@@ -239,25 +247,27 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
 
     # --- AI Configuration helpers ---
     def load_ai_config(self):
-        """Load AI API keys configuration from JSON file"""
+        """Load non-secret AI configuration from JSON file."""
         try:
             if os.path.exists(self.ai_config_path):
                 with open(self.ai_config_path, 'r') as f:
-                    return json.load(f)
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        return {k: raw[k] for k in SAFE_AI_CONFIG_KEYS if k in raw}
         except Exception as e:
             print(f"Failed to load AI config: {e}")
         return {
-            'openai_key': '',
-            'anthropic_key': '',
-            'gemini_key': '',
-            'selected_provider': 'openai'  # default provider
+            'selected_provider': 'local',
         }
 
     def save_ai_config(self):
-        """Save AI configuration to JSON file"""
+        """Save only non-secret AI configuration to JSON file."""
         try:
+            safe_config = {}
+            if isinstance(self.ai_config, dict):
+                safe_config = {k: self.ai_config[k] for k in SAFE_AI_CONFIG_KEYS if k in self.ai_config}
             with open(self.ai_config_path, 'w') as f:
-                json.dump(self.ai_config, f, indent=2)
+                json.dump(safe_config, f, indent=2)
         except Exception as e:
             print(f"Failed to save AI config: {e}")
 
@@ -2687,6 +2697,31 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
         left_expr = m.group(1).strip()
         op = m.group(2)
         right_expr = m.group(3).strip()
+        tail_after_match = m.string[m.end():]
+
+        # Guard against wildcard selects and partial alias fragments such as:
+        #   P.* , B.* , alias.
+        # which the broad arithmetic regex can otherwise misread as math.
+        if left_expr.endswith(".") or right_expr.endswith("."):
+            return m.group(0)
+
+        # Guard against SQL function calls such as:
+        #   amount - COALESCE(other_amount, 0)
+        # where the regex only captures "COALESCE" and leaves "(...)" behind.
+        if re.match(r"^\s*\(", tail_after_match):
+            return m.group(0)
+
+        wildcard_like = {"*", ".*"}
+        if left_expr in wildcard_like or right_expr in wildcard_like:
+            return m.group(0)
+
+        sql_tokens = {
+            "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "JOIN", "LEFT", "RIGHT",
+            "INNER", "OUTER", "FULL", "CROSS", "ON", "AS", "WITH", "UNION", "ALL",
+            "LIMIT", "HAVING", "QUALIFY", "FILTER", "EXCLUDE", "REPLACE"
+        }
+        if left_expr.upper() in sql_tokens or right_expr.upper() in sql_tokens:
+            return m.group(0)
 
         # Skip temporal keywords so date arithmetic like CURRENT_DATE - INTERVAL 6 MONTH
         # is not rewritten into invalid numeric casts.
@@ -2962,14 +2997,37 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
 
     def show_ai_assistant(self):
         """Show AI Assistant dialog"""
-        # Keep a reference to the dialog so it persists
-        if not hasattr(self, 'ai_assistant_dialog') or self.ai_assistant_dialog is None:
-            self.ai_assistant_dialog = AIAssistantDialog(self)
+        self._prepare_ai_assistant_dialog()
         
         # Show the dialog (non-modal) so user can interact with main window
         self.ai_assistant_dialog.show()
         self.ai_assistant_dialog.raise_()
         self.ai_assistant_dialog.activateWindow()
+
+    def _prepare_ai_assistant_dialog(self):
+        """Create the AI assistant dialog once and reuse the shared AI client."""
+        if self.ai_assistant_dialog is None:
+            self.ai_assistant_dialog = AIAssistantDialog(self, shared_client=self.shared_ai_client)
+
+    def _preload_ai_model(self):
+        """Preload the default GGUF model in the background without constructing the AI dialog."""
+        if self.shared_ai_client.is_loaded() or getattr(self.shared_ai_client, "_loading", False):
+            return
+
+        model_key = None
+        try:
+            cfg = self.ai_config if isinstance(getattr(self, "ai_config", None), dict) else {}
+            model_key = cfg.get("default_model") or self.shared_ai_client.get_default_model_key()
+        except Exception:
+            model_key = self.shared_ai_client.get_default_model_key()
+
+        if not model_key:
+            return
+
+        self._ai_model_loader = ModelLoaderThread(self.shared_ai_client, model_key)
+        self._ai_model_loader.finished_ok.connect(lambda: logger.info(f"Background AI model ready: {model_key}"))
+        self._ai_model_loader.finished_err.connect(lambda err: logger.warning(f"Background AI model preload failed: {err}"))
+        self._ai_model_loader.start()
 
 
     def _duckdb_copy_from_parquet(self, src_parquet_path: str, dest_path: str, format: str = 'csv'):

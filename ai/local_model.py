@@ -22,6 +22,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+class GenerationCancelled(Exception):
+    """Raised when a local generation is cancelled by the caller."""
+
 # ── PyInstaller frozen-bundle fix for llama_cpp native DLLs ──────────
 # When running as a packaged .exe, sys._MEIPASS points to the _internal
 # folder.  llama_cpp expects its DLLs in a 'lib' sub-directory relative
@@ -44,37 +48,7 @@ def _fix_llama_dll_path():
 
 _fix_llama_dll_path()
 
-# Model registry: filename, description
-AVAILABLE_MODELS = {
-    "tinyllama": {
-        "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "description": "TinyLlama 1.1B (Very Fast, ~0.7 GB)",
-        "context_length": 2048,
-    },
-    "gemma-2b": {
-        "filename": "gemma-2-2b-it-Q4_K_M.gguf",
-        "description": "Gemma 2 2B (Fast, ~1.5 GB)",
-        "context_length": 4096,
-    },
-    "phi-2": {
-        "filename": "phi-2.Q4_K_M.gguf",
-        "description": "Phi-2 2.7B (Good quality, ~1.6 GB)",
-        "context_length": 2048,
-    },
-    "gemma-4-4b": {
-        "filename": "gemma-4-E4B-it-Q3_K_M.gguf",
-        "description": "Gemma 4 4B (Best quality, ~4 GB)",
-        "context_length": 8192,
-        "flash_attn": True,
-    },
-    "sqlcoder-7b": {
-        "filename": "sqlcoder-7b.Q4_K_M.gguf",
-        "description": "SQLCoder 7B (SQL-specialized, ~4.1 GB)",
-        "context_length": 8192,
-    },
-}
-
-DEFAULT_MODEL = "gemma-2b"
+DEFAULT_CONTEXT_LENGTH = 8192
 
 
 def get_models_dir() -> Path:
@@ -105,6 +79,28 @@ def get_models_dir() -> Path:
     return v1_models_dir
 
 
+def _describe_model_file(model_path: Path) -> str:
+    stem = model_path.stem.replace("-", " ").replace("_", " ")
+    try:
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        size_str = f"{size_mb / 1024:.1f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
+        return f"{stem} (~{size_str})"
+    except OSError:
+        return stem
+
+
+def _discover_model_entries() -> list[dict]:
+    models_dir = get_models_dir()
+    result = []
+    for model_path in sorted(models_dir.glob("*.gguf")):
+        result.append({
+            "key": model_path.name,
+            "description": _describe_model_file(model_path),
+            "path": str(model_path),
+        })
+    return result
+
+
 class LocalModelClient:
     """
     Client that loads GGUF models via llama-cpp-python.
@@ -126,78 +122,47 @@ class LocalModelClient:
     @staticmethod
     def list_available_models() -> list[dict]:
         """Return metadata for local GGUF models present on disk only."""
-        result = []
-        seen_files = set()
-        models_dir = get_models_dir()
+        return _discover_model_entries()
 
-        # 1. Registered models that exist locally.
-        for key, info in AVAILABLE_MODELS.items():
-            local_path = models_dir / info["filename"]
-            if not local_path.exists():
-                continue
-            seen_files.add(info["filename"].lower())
-            result.append({
-                "key": key,
-                "description": info["description"],
-                "path": str(local_path),
-            })
+    @staticmethod
+    def get_default_model_key() -> Optional[str]:
+        models = _discover_model_entries()
+        return models[0]["key"] if models else None
 
-        # 2. Auto-detect any .gguf files manually placed in models/ folder
-        for f in sorted(models_dir.glob("*.gguf")):
-            if f.name.lower() not in seen_files:
-                # Derive a readable name from the filename
-                stem = f.stem.replace("-", " ").replace("_", " ")
-                size_mb = f.stat().st_size / (1024 * 1024)
-                if size_mb >= 1024:
-                    size_str = f"{size_mb / 1024:.1f} GB"
-                else:
-                    size_str = f"{size_mb:.0f} MB"
-                result.append({
-                    "key": f"custom:{f.name}",
-                    "description": f"{stem} (Custom, ~{size_str})",
-                    "path": str(f),
-                })
-
-        return result
-
-    def resolve_model_path(self, model_key: str = DEFAULT_MODEL, progress_callback=None) -> str:
+    def resolve_model_path(self, model_key: Optional[str] = None, progress_callback=None) -> str:
         """
-        Resolve the local path for a registered GGUF model.
+        Resolve the local path for a discovered GGUF model.
 
         Args:
-            model_key: Key from AVAILABLE_MODELS
+            model_key: GGUF filename key from list_available_models()
             progress_callback: Optional callable(status_text)
 
         Returns:
             Local file path to the model.
         """
-        if model_key not in AVAILABLE_MODELS:
-            raise ValueError(f"Unknown model: {model_key}. Choose from {list(AVAILABLE_MODELS)}")
-
-        info = AVAILABLE_MODELS[model_key]
-        local_path = get_models_dir() / info["filename"]
-
-        if local_path.exists():
-            logger.info(f"Model available locally: {local_path}")
-            if progress_callback:
-                progress_callback(f"Model already available: {info['description']}")
-            return str(local_path)
+        resolved_key = model_key or self.get_default_model_key()
+        models = {m["key"]: m for m in self.list_available_models()}
+        info = models.get(resolved_key or "")
+        if info:
+            local_path = Path(info["path"])
+            if local_path.exists():
+                logger.info(f"Model available locally: {local_path}")
+                if progress_callback:
+                    progress_callback(f"Model already available: {info['description']}")
+                return str(local_path)
 
         message = (
-            f"Model file not found: {local_path}. "
-            f"Add '{info['filename']}' to '{get_models_dir()}' to use this model in offline mode."
+            f"Model file not found for key: {resolved_key}. "
+            f"Add a .gguf model to '{get_models_dir()}' to use this model in offline mode."
         )
         logger.warning(message)
         if progress_callback:
             progress_callback("Model file not found locally. Add the GGUF model to the models folder.")
         raise FileNotFoundError(message)
 
-    def load_model(self, model_key: str = DEFAULT_MODEL, progress_callback=None) -> bool:
+    def load_model(self, model_key: Optional[str] = None, progress_callback=None) -> bool:
         """
         Load a model from local disk into memory.
-
-        Supports registered models (by key) and custom .gguf files
-        placed in the models/ folder (key starts with 'custom:').
 
         Returns True on success, False on failure.
         """
@@ -206,47 +171,109 @@ class LocalModelClient:
 
         self._loading = True
         try:
-            # Handle custom models (manually placed .gguf files)
-            if model_key.startswith("custom:"):
-                filename = model_key[len("custom:"):]
-                model_path = str(get_models_dir() / filename)
-                if not os.path.exists(model_path):
-                    logger.error(f"Custom model file not found: {model_path}")
-                    return False
-                ctx_length = 4096  # sensible default for unknown models
-                if progress_callback:
-                    progress_callback(f"Loading custom model: {filename}...")
-            else:
-                info = AVAILABLE_MODELS.get(model_key)
-                if info is None:
-                    logger.error(f"Unknown model key: {model_key}")
-                    return False
-                # Resolve local file path for registered models.
-                model_path = self.resolve_model_path(model_key, progress_callback)
-                ctx_length = info["context_length"]
+            resolved_key = model_key or self.get_default_model_key()
+            if not resolved_key:
+                logger.error("No GGUF models found in models folder")
+                return False
+
+            model_info = {m["key"]: m for m in self.list_available_models()}.get(resolved_key)
+            if model_info is None:
+                logger.error(f"Unknown model key: {resolved_key}")
+                return False
+
+            configured_ctx_length = DEFAULT_CONTEXT_LENGTH
+            model_path = self.resolve_model_path(resolved_key, progress_callback)
+            ctx_length = configured_ctx_length
 
             if progress_callback:
                 progress_callback("Loading model into memory...")
 
             from llama_cpp import Llama
 
-            use_flash_attn = AVAILABLE_MODELS.get(model_key, {}).get("flash_attn", False)
-            self.llm = Llama(
-                model_path=model_path,
-                n_ctx=0,
-                n_threads=os.cpu_count() or 4,
-                flash_attn=use_flash_attn,
-                verbose=False,
-            )
-            self.model_name = model_key
+            use_flash_attn = os.environ.get("SIMPLISQL_FLASH_ATTN", "").strip().lower() in {"1", "true", "yes", "on"}
+
+            ctx_length = int(ctx_length) if 'ctx_length' in locals() else DEFAULT_CONTEXT_LENGTH
+
+            requested_ctx = os.environ.get("SIMPLISQL_CONTEXT_LENGTH", "").strip()
+            if requested_ctx:
+                try:
+                    ctx_length = max(512, int(requested_ctx))
+                except ValueError:
+                    logger.warning(f"Ignoring invalid SIMPLISQL_CONTEXT_LENGTH={requested_ctx!r}")
+
+            if not requested_ctx:
+                # Load with n_ctx=1 (minimal KV cache) purely to read model metadata.
+                # This is ~identical RAM cost to mmap loading the weights; no full
+                # context buffer is allocated, so it's fast and cheap.
+                _meta_llm = Llama(
+                    model_path=model_path,
+                    n_ctx=1,
+                    n_threads=os.cpu_count() or 4,
+                    flash_attn=use_flash_attn,
+                    verbose=False,
+                )
+                try:
+                    model_meta = getattr(getattr(_meta_llm, '_ctx', None), 'model', None)
+                    if model_meta is not None and hasattr(model_meta, 'n_ctx_train'):
+                        try:
+                            train_ctx = int(model_meta.n_ctx_train())
+                            if train_ctx > ctx_length:
+                                ctx_length = train_ctx
+                                logger.info(f"Using model's native context length: {ctx_length}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # If the target context is small enough that n_ctx=1 just needs a
+                # reload, close the probe. Otherwise reuse it if ctx matches exactly.
+                # In practice we always need to reload with the real n_ctx, so close.
+                try:
+                    _meta_llm.close()
+                except Exception:
+                    pass
+
+            try:
+                self.llm = Llama(
+                    model_path=model_path,
+                    n_ctx=ctx_length,
+                    n_threads=os.cpu_count() or 4,
+                    flash_attn=use_flash_attn,
+                    verbose=False,
+                )
+                logger.info(f"Loaded {resolved_key} with context={ctx_length}")
+            except Exception as load_error:
+                fallback_ctx = int(configured_ctx_length or DEFAULT_CONTEXT_LENGTH)
+                if ctx_length <= fallback_ctx:
+                    raise
+                logger.warning(
+                    f"Failed to load {resolved_key} with context={ctx_length}: {load_error}. "
+                    f"Retrying with context={fallback_ctx}."
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"Large context load failed; retrying with {fallback_ctx} token context..."
+                    )
+                self.llm = Llama(
+                    model_path=model_path,
+                    n_ctx=fallback_ctx,
+                    n_threads=os.cpu_count() or 4,
+                    flash_attn=use_flash_attn,
+                    verbose=False,
+                )
+            self.model_name = resolved_key
             self.model_path = model_path
-            self.context_length = int(ctx_length)
-            logger.info(f"Model loaded: {model_key}")
+            self.context_length = int(
+                getattr(getattr(self.llm, 'context_params', None), 'n_ctx', ctx_length)
+            )
+            logger.info(f"Model loaded: {resolved_key} (context={self.context_length})")
             if progress_callback:
-                desc = AVAILABLE_MODELS.get(model_key, {}).get("description", model_key)
-                progress_callback(f"Model ready: {desc}")
+                progress_callback(f"Model ready: {model_info['description']}")
             return True
 
+        except GenerationCancelled:
+            logger.info("Streaming chat cancelled by user.")
+            raise
         except Exception as e:
             logger.error(f"Failed to load model {model_key}: {e}")
             if progress_callback:
@@ -309,7 +336,8 @@ class LocalModelClient:
             raise
 
     def chat_streaming(self, messages: list[dict], max_tokens: int = 512,
-                       temperature: float = 0.7, token_callback=None) -> str:
+                       temperature: float = 0.7, token_callback=None,
+                       stop_callback=None) -> str:
         """
         Streaming chat generation – calls token_callback(chunk: str) for each token.
         Returns the full concatenated text when done.
@@ -342,6 +370,8 @@ class LocalModelClient:
 
         try:
             full_text = []
+            if callable(stop_callback) and stop_callback():
+                raise GenerationCancelled()
             stream = self.llm.create_chat_completion(
                 messages=cleaned,
                 max_tokens=max_tokens,
@@ -349,21 +379,29 @@ class LocalModelClient:
                 stream=True,
             )
             for chunk in stream:
+                if callable(stop_callback) and stop_callback():
+                    raise GenerationCancelled()
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 token = delta.get("content", "")
                 if token:
                     full_text.append(token)
                     if token_callback:
-                        token_callback(token)
+                        callback_result = token_callback(token)
+                        if callback_result is False:
+                            raise GenerationCancelled()
             result = "".join(full_text).strip()
             logger.info(f"Streaming chat response: {len(result)} chars")
             return result
         except Exception as e:
             logger.warning(f"Streaming failed ({e}), falling back to non-streaming chat()")
+            if callable(stop_callback) and stop_callback():
+                raise GenerationCancelled()
             # Fall back – collect full response then emit it as one chunk
             result = self.chat(messages, max_tokens=max_tokens, temperature=temperature)
             if token_callback:
-                token_callback(result)
+                callback_result = token_callback(result)
+                if callback_result is False:
+                    raise GenerationCancelled()
             return result
 
     def chat(self, messages: list[dict], max_tokens: int = 512,

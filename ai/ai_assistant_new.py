@@ -1,5 +1,5 @@
-"""
-AI Assistant Dialog for SimpliSQL – Local GGUF Edition
+﻿"""
+AI Assistant Dialog for SimpliSQL â€“ Local GGUF Edition
 =======================================================
 Runs models entirely in-process via llama-cpp-python.
 No Ollama, no cloud APIs, no external services.
@@ -11,6 +11,7 @@ import os
 import json
 import logging
 import re
+import html
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -20,26 +21,34 @@ from PyQt6.QtWidgets import (
     QScrollArea
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QColor
 
-from ai.local_model import LocalModelClient, AVAILABLE_MODELS, DEFAULT_MODEL
+from ai.local_model import LocalModelClient, GenerationCancelled
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Auto_Workflow", "ai_config.json")
+SAFE_AI_CONFIG_KEYS = {"selected_provider", "default_model"}
 
 
 def _load_ai_config() -> dict:
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+            raw = json.load(f)
+            if isinstance(raw, dict):
+                return {k: raw[k] for k in SAFE_AI_CONFIG_KEYS if k in raw}
     except Exception:
         return {}
+    return {}
 
 
 def _save_ai_config(cfg: dict):
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    safe_cfg = {}
+    if isinstance(cfg, dict):
+        safe_cfg = {k: cfg[k] for k in SAFE_AI_CONFIG_KEYS if k in cfg}
     with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(safe_cfg, f, indent=2)
 
 
 def _strip_ai_diagnostics(response: str) -> str:
@@ -47,9 +56,9 @@ def _strip_ai_diagnostics(response: str) -> str:
         return ""
 
     markers = [
-        "\n\n---\n🔍 **Self-check correction:**",
-        "\n\n---\n🔧 Issues detected:",
-        "\n\n---\n🔎 Schema checks:",
+        "\n\n---\nðŸ” **Self-check correction:**",
+        "\n\n---\nðŸ”§ Issues detected:",
+        "\n\n---\nðŸ”Ž Schema checks:",
     ]
     end = len(response)
     for marker in markers:
@@ -129,42 +138,29 @@ def _sql_candidate_complete(sql_text: str) -> bool:
     return True
 
 
-def _python_candidate_complete(py_text: str) -> bool:
-    s = (py_text or "").strip()
-    if not s:
-        return False
-    if s.count("(") > s.count(")"):
-        return False
-    if s.count("[") > s.count("]"):
-        return False
-    if s.count("{") > s.count("}"):
-        return False
-    lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
-    if not lines:
-        return False
-    last = lines[-1].strip()
-    if last.endswith(":") or last.endswith("\\"):
-        return False
-    if re.search(r"(?i)\b(and|or|if|for|while|with|except|elif|else|try)\s*$", last):
-        return False
-    return True
-
-
-def _response_needs_continuation(response: str, max_tokens: int, mode_hint: str = "auto") -> bool:
-    """Heuristic to detect responses likely truncated by token limits."""
+def _response_needs_continuation(response: str, max_tokens: int, mode_hint: str = "sql") -> bool:
+    """Enhanced diagnostic heuristic to catch local LLM token truncation."""
     cleaned = _strip_ai_diagnostics(response or "").strip()
     if not cleaned:
         return False
 
+    # Guardrail 1: Code fence is explicitly cut off mid-air
     if _has_unclosed_code_fence(cleaned):
         return True
 
-    mode = (mode_hint or "auto").lower()
-    sql_candidates = _extract_sql_candidates_from_text(cleaned)
-    py_candidates = _extract_python_candidates_from_text(cleaned)
+    # Guardrail 2: Token Proximity Safety Check
+    # If the model filled up more than 85% of its allowed chunk budget, it likely choked
+    estimated_output_tokens = _estimate_text_tokens(cleaned)
+    if estimated_output_tokens >= int(max_tokens * 0.85):
+        # If it finished with a formal SQL semicolon, it's genuinely done
+        if cleaned.endswith(";"):
+            return False
+        return True
 
-    # Structural completeness checks should run regardless of token cap proximity.
-    # Large multi-pass answers can look "not near cap" but still be incomplete.
+    # Guardrail 3: Legacy structural heuristics
+    mode = (mode_hint or "sql").lower()
+    sql_candidates = _extract_sql_candidates_from_text(cleaned)
+
     if mode == "sql":
         if sql_candidates:
             return not _sql_candidate_complete(sql_candidates[-1])
@@ -174,27 +170,9 @@ def _response_needs_continuation(response: str, max_tokens: int, mode_hint: str 
                 return True
         return False
 
-    if mode == "python":
-        if py_candidates:
-            return not _python_candidate_complete(py_candidates[-1])
-        if re.search(r"(?i)\b(import|def|class|for|while|if|try|with)\b", cleaned):
-            tail = cleaned[-160:]
-            if re.search(r"(?i)(\\|\b(and|or|if|for|while|with|except|elif|else|try))\s*$", tail):
-                return True
-        return False
-
     if sql_candidates:
         return not _sql_candidate_complete(sql_candidates[-1])
-    if py_candidates:
-        return not _python_candidate_complete(py_candidates[-1])
 
-    near_cap = _estimate_text_tokens(cleaned) >= max(64, int(max_tokens * 0.9))
-    if not near_cap:
-        return False
-
-    tail = cleaned[-200:]
-    if re.search(r"(?i)(,|\b(AND|OR|FROM|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY|HAVING|QUALIFY))\s*$", tail):
-        return True
     return False
 
 
@@ -237,111 +215,7 @@ def _needs_more_sql_lines(response: str, requested_min_lines: int) -> bool:
     return _largest_sql_candidate_line_count(response) < requested_min_lines
 
 
-# Intent signals ---------------------------------------------------------
-_PYTHON_SIGNALS = re.compile(
-    r"\b("
-    r"python|pandas|numpy|scipy|sklearn|scikit.learn|statsmodels|matplotlib|seaborn|plotly|"
-    r"machine.learning|ml\b|deep.learning|neural.network|tensorflow|pytorch|keras|"
-    r"plot|chart|histogram|heatmap|scatter.?plot|bar.?chart|line.?chart|"
-    r"train|predict|fit|model|classifier|regressor|clustering|pca|feature.engineering|"
-    r"correlation|covariance|outlier|anomaly|impute|normaliz|standardiz|"
-    r"dataframe|series|ndarray|pivot.?table|melt|reshape|"
-    r"read_csv|read_excel|to_csv|merge|concat|groupby|apply|lambda|"
-    r"for.loop|list.comprehension|script|class|def |import "
-    r")\b",
-    re.IGNORECASE,
-)
-
-_SQL_SIGNALS = re.compile(
-    r"\b(select|from|where|join|group\s+by|order\s+by|having|insert|update|delete|create\s+table|"
-    r"with\s+\w+\s+as|count\(|sum\(|avg\(|max\(|min\(|duckdb|sql|query|table)\b",
-    re.IGNORECASE,
-)
-
-# High-priority phrases that should always route to Python mode.
-_PYTHON_PRIORITY_SIGNALS = re.compile(
-    r"\b("
-    r"predict|prediction|forecast|forecasting|time\s*series|"
-    r"arima|sarima|prophet|lstm|"
-    r"train\s+model|classification|regression|"
-    r"feature\s+engineering|cross\s*validation|"
-    r"anomaly\s+detection|clustering|"
-    r"next\s+\d+\s*(day|days|week|weeks|month|months|year|years)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _classify_intent(user_text: str) -> str:
-    """Return 'python', 'sql', or 'auto' based on keyword heuristics."""
-    if _PYTHON_PRIORITY_SIGNALS.search(user_text or ""):
-        return "python"
-
-    py_hits = len(_PYTHON_SIGNALS.findall(user_text))
-    sql_hits = len(_SQL_SIGNALS.findall(user_text))
-    if py_hits > sql_hits:
-        return "python"
-    if sql_hits > py_hits:
-        return "sql"
-    # Ambiguous prompts work better as SQL in SimpliSQL unless they include
-    # high-priority Python analytics terms above.
-    return "sql"
-
-
-def _extract_python_candidates_from_text(response: str) -> list:
-    """Extract Python code blocks from an AI response.
-
-    Falls back to plain-text line scanning when the model omits code fences,
-    which small local models often do.
-    """
-    candidates = []
-
-    # 1. Explicit ```python ... ``` blocks
-    py_blocks = re.findall(r"```python\s*(.*?)```", response, re.DOTALL | re.IGNORECASE)
-    candidates.extend([b.strip() for b in py_blocks if b.strip()])
-
-    # 2. Generic ``` ... ``` blocks that look like Python
-    if not candidates:
-        generic_blocks = re.findall(r"```\s*(.*?)```", response, re.DOTALL)
-        for block in generic_blocks:
-            if re.search(r"\b(import|def |for |pd\.|df\.|plt\.|np\.|result_df|result_sql|to_df|sql\(|load_relation)\b", block):
-                candidates.append(block.strip())
-
-    # 3. Plain-text fallback: collect consecutive lines that look like Python code
-    #    (no fences at all — common with small local GGUF models)
-    if not candidates:
-        _PYTHON_LINE = re.compile(
-            r"^\s*("
-            r"(import |from \w)|"          # import statements
-            r"(def |class )|"              # definitions
-            r"(for |while |if |elif |else:|try:|except|with )|"  # control flow
-            r"(result_df|result_sql|result_relation)\s*=|"       # SimpliSQL output vars
-            r"(to_df|sql|load_relation|stream_df)\s*\(|"         # DuckDB helpers
-            r"(pd\.|df\.|np\.|plt\.|sns\.|sklearn\.|sm\.|xgb\.|lgb\.|px\.)|"  # lib usage
-            r"#"                           # comment line
-            r")"
-        )
-        lines = response.splitlines()
-        block_lines: list[str] = []
-        collected_blocks: list[str] = []
-        for line in lines:
-            if _PYTHON_LINE.match(line) or (block_lines and line.strip() == ""):
-                block_lines.append(line)
-            else:
-                if len(block_lines) >= 2:  # at least 2 Python-looking lines = a block
-                    collected_blocks.append("\n".join(block_lines).strip())
-                block_lines = []
-        if len(block_lines) >= 2:
-            collected_blocks.append("\n".join(block_lines).strip())
-        # Keep only blocks that contain at least one "real" Python statement
-        for blk in collected_blocks:
-            if re.search(r"\b(result_df|result_sql|to_df|sql\(|load_relation|import |def |pd\.|df\.)\b", blk):
-                candidates.append(blk)
-
-    return candidates
-
-
-# ── Background threads ────────────────────────────────────────────────
+# â”€â”€ Background threads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class ModelLoaderThread(QThread):
     """Load a model without freezing the UI."""
@@ -382,32 +256,18 @@ class AIChatThread(QThread):
         self.client = client
         self.messages = messages
         self.user_request = user_request
-        self.answer_mode = (answer_mode or "auto").lower()
+        self.answer_mode = "sql"
         self.requested_min_lines = 0
-        if self.answer_mode == "sql":
-            self.requested_min_lines = _extract_requested_min_lines(self.user_request)
+        self.requested_min_lines = _extract_requested_min_lines(self.user_request)
 
     def _build_continuation_messages(self, accumulated_text: str, ctx: int) -> list:
-        target_map = {
-            "sql": "DuckDB SQL",
-            "python": "Python code",
-        }
-        target_label = target_map.get(self.answer_mode, "response")
         tail_chars = max(2000, min(24000, ctx * 4))
         assistant_tail = (accumulated_text or "")[-tail_chars:]
-        min_line_clause = ""
-        if self.answer_mode == "sql" and self.requested_min_lines > 0:
-            min_line_clause = (
-                f"The final SQL query must contain at least {self.requested_min_lines} lines.\n"
-            )
         continuation_prompt = (
-            "Continue exactly from where your previous response stopped.\n"
-            "Do not repeat any content already provided.\n"
-            f"Return only the remaining {target_label}.\n"
-            "Keep continuing the same query; do not start a new separate query.\n"
-            "Do not stop until the full final query is complete.\n"
-            f"{min_line_clause}"
-            "If the response is already complete, return exactly: <DONE>"
+            "You ran out of output space. Continue generating the exact DuckDB SQL query "
+            "above from the very last character without repeating any existing text.\n"
+            "Do not start a new query block. Do not provide explanations. Output ONLY the "
+            "remaining valid SQL code required to finish the complete query."
         )
 
         continuation_messages = []
@@ -421,7 +281,7 @@ class AIChatThread(QThread):
     def run(self):
         try:
             # Calculate max_tokens from both context window and estimated prompt size.
-            # This avoids output truncation/failures for large SQL/Python generations.
+            # This avoids output truncation/failures for large SQL generations.
             ctx = getattr(self.client, 'context_length', 4096)
             prompt_tokens = 0
             for msg in self.messages:
@@ -442,13 +302,17 @@ class AIChatThread(QThread):
 
             # Pass 1: Stream the response token-by-token
             def _on_token(token: str):
+                if self.isInterruptionRequested():
+                    return False
                 self.token_ready.emit(token)
+                return True
 
             text = self.client.chat_streaming(
                 self.messages,
                 max_tokens=main_max_tokens,
                 temperature=0.3,
                 token_callback=_on_token,
+                stop_callback=self.isInterruptionRequested,
             )
             if not text:
                 self.error_occurred.emit("Model returned an empty response.")
@@ -457,15 +321,10 @@ class AIChatThread(QThread):
             # Auto-continuation for long responses: keep requesting follow-up chunks
             # while the output appears truncated by token limits.
             combined_text = text
-            max_continuations = 24
-            if self.answer_mode == "python":
-                max_continuations = 30
-            if self.answer_mode == "sql":
-                max_continuations = 40
-            if self.answer_mode == "sql" and self.requested_min_lines >= 150:
+            max_continuations = 40
+            if self.requested_min_lines >= 150:
                 max_continuations = 50
             continuation_count = 0
-            completion_probe_used = False
 
             while continuation_count < max_continuations:
                 if self.isInterruptionRequested():
@@ -476,19 +335,10 @@ class AIChatThread(QThread):
                     main_max_tokens,
                     self.answer_mode,
                 )
-                needs_line_target = (
-                    self.answer_mode == "sql"
-                    and _needs_more_sql_lines(combined_text, self.requested_min_lines)
-                )
+                needs_line_target = _needs_more_sql_lines(combined_text, self.requested_min_lines)
 
-                # Even when heuristics say "complete", do one confirmation pass
-                # and let the model explicitly return <DONE>.
                 if not (needs_completion or needs_line_target):
-                    if completion_probe_used:
-                        break
-                    completion_probe_used = True
-                else:
-                    completion_probe_used = False
+                    break
 
                 continuation_count += 1
                 continuation_messages = self._build_continuation_messages(combined_text, ctx)
@@ -509,9 +359,11 @@ class AIChatThread(QThread):
                     continuation_messages,
                     max_tokens=continuation_max_tokens,
                     temperature=0.2,
-                    # Do not stream continuation chunks directly to the UI;
-                    # they may contain overlap used for stitching.
+                    # We'll receive the continuation_text as a whole and
+                    # stream only the truly new tail to the UI so the
+                    # user sees progress without duplicating overlap.
                     token_callback=None,
+                    stop_callback=self.isInterruptionRequested,
                 )
                 if not continuation_text:
                     break
@@ -519,13 +371,28 @@ class AIChatThread(QThread):
                 if continuation_text.strip() == "<DONE>":
                     break
 
+                # Merge while computing the newly added tail so we can
+                # stream only the delta to the UI.
                 merged_text = _merge_with_overlap(combined_text, continuation_text)
                 if merged_text == combined_text:
                     break
+                # The new content appended by this continuation
+                new_tail = merged_text[len(combined_text):]
                 combined_text = merged_text
+
+                # Emit the newly added tail in small chunks so UI updates
+                # appear incrementally. Use whitespace-aware chunking.
+                import re
+                parts = re.findall(r"\s+|\S+", new_tail)
+                for part in parts:
+                    if self.isInterruptionRequested():
+                        return
+                    try:
+                        self.token_ready.emit(part)
+                    except Exception:
+                        # If the receiver disappeared or UI is closing, abort.
+                        return
                 main_max_tokens = continuation_max_tokens
-                # New content arrived; allow another completion-confirmation probe.
-                completion_probe_used = False
 
             text = combined_text
 
@@ -539,7 +406,7 @@ class AIChatThread(QThread):
                 if "WHERE" in text_upper and "ROW_NUMBER()" in text_upper:
                     if "QUALIFY" not in text_upper:
                         error_fixes.append(
-                            "⚠️ WHERE clause with window function detected. "
+                            "âš ï¸ WHERE clause with window function detected. "
                             "DuckDB requires QUALIFY instead of WHERE."
                         )
                 
@@ -569,36 +436,38 @@ class AIChatThread(QThread):
                     if fixed_text != text:
                         text = fixed_text
                         error_fixes.append(
-                            "🔧 Auto-fixed: Removed invalid QUALIFY clause (QUALIFY requires a window function like ROW_NUMBER() OVER (...))."
+                            "ðŸ”§ Auto-fixed: Removed invalid QUALIFY clause (QUALIFY requires a window function like ROW_NUMBER() OVER (...))."
                         )
                     else:
                         error_fixes.append(
-                            "⚠️ QUALIFY used without a window function. "
+                            "âš ï¸ QUALIFY used without a window function. "
                             "QUALIFY only works with window functions (e.g. ROW_NUMBER() OVER (...)). "
                             "Use WHERE or HAVING for regular filters."
                         )
                 
                 if error_fixes:
-                    text = text + "\n\n---\n🔧 Issues detected:\n" + "\n".join(error_fixes)
+                    text = text + "\n\n---\nðŸ”§ Issues detected:\n" + "\n".join(error_fixes)
 
             self.response_ready.emit(text)
+        except GenerationCancelled:
+            return
         except Exception as e:
             self.error_occurred.emit(str(e))
 
 
-# ── Dialog ────────────────────────────────────────────────────────────
+# â”€â”€ Dialog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class AIAssistantDialog(QDialog):
-    """AI Assistant dialog – fully local, no external services."""
+    """AI Assistant dialog â€“ fully local, no external services."""
 
-    def __init__(self, parent_editor):
+    def __init__(self, parent_editor, shared_client=None):
         super().__init__(parent_editor)
         self.parent_editor = parent_editor
         self.current_conversation = []
-        self.setWindowTitle("🤖 AI Assistant (Local Model)")
+        self.setWindowTitle("ðŸ¤– AI Assistant (Local Model)")
 
         # Core client
-        self.client = LocalModelClient()
+        self.client = shared_client if shared_client is not None else LocalModelClient()
         self._force_close = False
         self._chat_thread = None
         self._generation_cancelled = False
@@ -606,7 +475,7 @@ class AIAssistantDialog(QDialog):
 
         # Load saved default model preference
         cfg = _load_ai_config()
-        self.selected_model_key = cfg.get("default_model", DEFAULT_MODEL)
+        self.selected_model_key = cfg.get("default_model") or self.client.get_default_model_key()
 
         # Window setup
         self.setMinimumSize(760, 520)
@@ -648,10 +517,10 @@ class AIAssistantDialog(QDialog):
                 break
 
         # Auto-load default model in background on startup
-        if not self.client.is_loaded():
+        if not self.client.is_loaded() and not getattr(self.client, "_loading", False):
             self._auto_load_default()
 
-    # ── UI construction ───────────────────────────────────────────────
+    # â”€â”€ UI construction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -665,14 +534,14 @@ class AIAssistantDialog(QDialog):
             QTabBar::tab:selected { background-color: #4caf50; color: white; }
         """)
 
-        self.tab_widget.addTab(self._chat_tab(), "💬 Chat")
-        self.tab_widget.addTab(self._settings_tab(), "⚙️ Settings")
+        self.tab_widget.addTab(self._chat_tab(), "Chat")
+        self.tab_widget.addTab(self._settings_tab(), "Settings")
         layout.addWidget(self.tab_widget)
 
         # Visible status strip so users can tell whether generation is running or done.
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
-        self._set_status_badge("🟢 Ready", "ready")
+        self._set_status_badge("Ready", "ready")
         layout.addWidget(self.status_label)
 
         self._generation_started_at = None
@@ -682,7 +551,7 @@ class AIAssistantDialog(QDialog):
 
         self.apply_theme()
 
-    # ── Chat tab ──────────────────────────────────────────────────────
+    # â”€â”€ Chat tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _chat_tab(self):
         w = QWidget()
@@ -713,7 +582,7 @@ class AIAssistantDialog(QDialog):
 
         ml.addWidget(QLabel("Answer mode:"))
         self.answer_mode_combo = QComboBox()
-        self.answer_mode_combo.addItem("🗃️ SQL Only", "sql")
+        self.answer_mode_combo.addItem("SQL Only", "sql")
         self.answer_mode_combo.setCurrentIndex(0)
         self.answer_mode_combo.setEnabled(False)
         self.answer_mode_combo.setToolTip(
@@ -732,7 +601,7 @@ class AIAssistantDialog(QDialog):
         lay.addWidget(model_frame)
 
         # Chat display
-        lay.addWidget(QLabel("<b style='font-size:16px'>💬 Chat</b>"))
+        lay.addWidget(QLabel("<b style='font-size:16px'>Chat</b>"))
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setMinimumHeight(400)
@@ -746,7 +615,7 @@ class AIAssistantDialog(QDialog):
         inp = QHBoxLayout()
         inp.setSpacing(10)
         self.user_input = QLineEdit()
-        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows…")
+        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows...")
         self.user_input.setStyleSheet("font-size:13px; padding:8px; border:2px solid #ddd; border-radius:4px;")
         self.user_input.returnPressed.connect(self.send_message)
         inp.addWidget(self.user_input)
@@ -785,7 +654,7 @@ class AIAssistantDialog(QDialog):
         clear_btn.setObjectName("clear_btn")
         inp.addWidget(clear_btn)
 
-        copy_btn = QPushButton("📋 Copy Last SQL")
+        copy_btn = QPushButton("Copy Last SQL")
         copy_btn.clicked.connect(self._copy_last_sql_to_editor)
         copy_btn.setStyleSheet(
             "QPushButton{padding:7px 12px 9px 12px;border-radius:4px;background:#e0e0e0;color:#333;border:1px solid #9e9e9e;border-bottom:3px solid #9e9e9e;}"
@@ -800,7 +669,7 @@ class AIAssistantDialog(QDialog):
 
         return w
 
-    # ── Settings tab ──────────────────────────────────────────────────
+    # â”€â”€ Settings tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _settings_tab(self):
         scroll = QScrollArea()
@@ -812,11 +681,11 @@ class AIAssistantDialog(QDialog):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(10)
 
-        lay.addWidget(QLabel("<b style='font-size:18px'>⚙️ Settings</b>"))
+        lay.addWidget(QLabel("<b style='font-size:18px'>Settings</b>"))
 
         # Internal model status label used by refresh/load logic.
         # Intentionally not added to Settings UI.
-        self.model_info_label = QLabel("Status: checking…")
+        self.model_info_label = QLabel("Status: checking...")
 
         # Context options
         cf = QFrame()
@@ -829,6 +698,10 @@ class AIAssistantDialog(QDialog):
         cl.addWidget(QLabel("<b>Tables To Include In AI Analysis</b>"))
         self.table_context_list = QListWidget()
         self.table_context_list.setMaximumHeight(140)
+        
+        # Apply stylesheet for checkbox visibility in both light and dark themes
+        self.table_context_list.setStyleSheet(self._table_context_list_style())
+
         cl.addWidget(self.table_context_list)
 
         table_btn_row = QHBoxLayout()
@@ -839,7 +712,7 @@ class AIAssistantDialog(QDialog):
         clear_all_btn = QPushButton("Clear All")
         clear_all_btn.clicked.connect(lambda: self._set_all_table_checks(Qt.CheckState.Unchecked))
         apply_tables_btn = QPushButton("Apply Selection")
-        apply_tables_btn.clicked.connect(self._sync_selected_tables_to_parent)
+        apply_tables_btn.clicked.connect(self._apply_selected_tables)
         table_btn_row.addWidget(refresh_tables_btn)
         table_btn_row.addWidget(select_all_btn)
         table_btn_row.addWidget(clear_all_btn)
@@ -855,7 +728,7 @@ class AIAssistantDialog(QDialog):
         dl.addWidget(QLabel("<b>Default Model (auto-loads on app start)</b>"))
         self.default_model_combo = QComboBox()
         self._refresh_default_model_combo()
-        save_default_btn = QPushButton("💾 Save as Default")
+        save_default_btn = QPushButton("ðŸ’¾ Save as Default")
         save_default_btn.setStyleSheet(
             "QPushButton{background:#2196F3;color:white;font-weight:bold;padding:7px 16px 9px 16px;border-radius:4px;border:1px solid #0d47a1;border-bottom:3px solid #0d47a1;}"
             "QPushButton:hover{background:#1e88e5;}"
@@ -880,13 +753,69 @@ class AIAssistantDialog(QDialog):
         scroll.setWidget(w)
         return scroll
 
-    # ── Library status (Milestone 3) ─────────────────────────────────
+    # â”€â”€ Library status (Milestone 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _is_dark_theme(self) -> bool:
+        return getattr(self.parent_editor, "current_theme", "dark") == "dark"
+
+    def _table_context_list_style(self) -> str:
+        if self._is_dark_theme():
+            bg = "#3c3c3c"
+            text = "#ffffff"
+            border = "#555555"
+            unchecked_bg = "#2b2b2b"
+            unchecked_border = "#b8b8b8"
+        else:
+            bg = "#ffffff"
+            text = "#1f1f1f"
+            border = "#cccccc"
+            unchecked_bg = "#ffffff"
+            unchecked_border = "#666666"
+
+        return f"""
+            QListWidget {{
+                background-color: {bg};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 4px;
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                color: {text};
+                padding: 4px;
+                margin: 2px 0px;
+            }}
+            QListWidget::item:hover {{
+                background-color: rgba(0, 120, 215, 0.2);
+            }}
+            QListWidget::item:selected {{
+                background-color: rgba(0, 120, 215, 0.3);
+                border: 1px solid #0078d7;
+            }}
+            QListWidget::indicator:unchecked {{
+                width: 18px;
+                height: 18px;
+                border: 2px solid {unchecked_border};
+                border-radius: 3px;
+                background-color: {unchecked_bg};
+            }}
+            QListWidget::indicator:checked {{
+                width: 18px;
+                height: 18px;
+                border: 2px solid #0078d7;
+                border-radius: 3px;
+                background-color: #0078d7;
+                background-image: url(data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='white' d='M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z'/></svg>);
+                background-repeat: no-repeat;
+                background-position: center;
+            }}
+        """
 
     def _refresh_library_status(self):
         """No-op in SQL-only mode."""
         return
 
-    # ── Theme ─────────────────────────────────────────────────────────
+    # â”€â”€ Theme â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def apply_theme(self):
         if hasattr(self.parent_editor, 'current_theme') and self.parent_editor.current_theme == 'dark':
@@ -902,23 +831,18 @@ class AIAssistantDialog(QDialog):
                 QListWidget { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; }
             """)
 
-    # ── Model management ──────────────────────────────────────────────
+    # â”€â”€ Model management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _describe_model_key(self, model_key: str) -> str:
         """Return a human-friendly model description for UI/status messages."""
         if not model_key:
             return "Unknown model"
 
-        info = AVAILABLE_MODELS.get(model_key, {})
-        desc = info.get("description", "")
-        if desc:
-            return desc
-
         for m in self.client.list_available_models():
             if m.get("key") == model_key:
                 return m.get("description", model_key)
 
-        return model_key.replace("custom:", "").replace("-", " ").replace("_", " ").replace(".gguf", "")
+        return (model_key or "Unknown model").replace("-", " ").replace("_", " ").replace(".gguf", "")
 
     def _refresh_model_status(self):
         models = self.client.list_available_models()
@@ -957,12 +881,12 @@ class AIAssistantDialog(QDialog):
         self.load_btn.setEnabled(bool(models))
 
         if not models:
-            self.status_label.setText("⚠️ No local model found in models folder")
+            self.status_label.setText("No local model found in models folder")
             if hasattr(self, 'model_info_label'):
                 self.model_info_label.setText("No local model found")
             self.chat_display.setHtml(
                 "<div style='padding:12px;background:#fff3e0;border-radius:4px;color:#e65100;'>"
-                "<b>⚠️ No local model found</b><br>"
+                "<b>No local model found</b><br>"
                 "Place at least one <b>.gguf</b> file in the local <b>models</b> folder, then reopen AI settings.<br><br>"
                 "<b>Offline only:</b> models are read only from local files."
                 "</div>"
@@ -972,20 +896,20 @@ class AIAssistantDialog(QDialog):
         if self.client.is_loaded():
             model_name = self.client.model_name
             desc = self._describe_model_key(model_name)
-            self.status_label.setText(f"✅ Model loaded: {desc}")
+            self.status_label.setText(f"Model loaded: {desc}")
             if hasattr(self, 'model_info_label'):
                 self.model_info_label.setText(f"Loaded: {desc}")
-            self.load_btn.setText("🔄 Reload Model")
+            self.load_btn.setText("Reload Model")
             self._add_welcome_message()
         else:
-            self.status_label.setText("⚠️ No model loaded – click 'Load Model'")
+            self.status_label.setText("No model loaded - click 'Load Model'")
             if hasattr(self, 'model_info_label'):
                 self.model_info_label.setText("No model loaded")
             self.chat_display.setHtml(
                 "<div style='padding:12px;background:#fff3e0;border-radius:4px;color:#e65100;'>"
-                "<b>⚠️ No model loaded</b><br>"
+                "<b>No model loaded</b><br>"
                 "Place a GGUF model file in the local <b>models</b> folder, then click <b>Load Model</b>.<br><br>"
-                "<b>No internet or external application needed</b> – everything runs locally inside SimpliSQL."
+                "<b>No internet or external application needed</b> - everything runs locally inside SimpliSQL."
                 "</div>"
             )
 
@@ -1007,13 +931,13 @@ class AIAssistantDialog(QDialog):
 
         desc = self._describe_model_key(key)
         self._model_load_start_time = datetime.now()
-        self.status_label.setText(f"⏳ Loading model into memory...")
+        self.status_label.setText("Loading model into memory...")
         self.load_btn.setEnabled(False)
         QApplication.processEvents()
 
         # Disable chat input during loading
         self.user_input.setEnabled(False)
-        self.user_input.setPlaceholderText("⏳ Loading model... Please wait.")
+        self.user_input.setPlaceholderText("Loading model... Please wait.")
         send_btn = self.findChild(QPushButton, "send_btn")
         if send_btn:
             send_btn.setEnabled(False)
@@ -1028,14 +952,14 @@ class AIAssistantDialog(QDialog):
         self.chat_display.append(
             f"<div style='margin:8px 0;padding:10px;background:#fff3e0;"
             f"border-left:3px solid #ff9800;border-radius:4px;'>"
-            f"<b style='color:#e65100;'>⏳ Loading Model:</b><br>"
+            f"<b style='color:#e65100;'>Loading Model:</b><br>"
             f"<div style='color:#000;margin-top:4px;'>Auto-loading {desc}... This may take a few minutes.</div></div>"
         )
         sb = self.chat_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 
         self._loader = ModelLoaderThread(self.client, key)
-        self._loader.progress.connect(lambda msg: self.status_label.setText(f"⏳ {msg}"))
+        self._loader.progress.connect(lambda msg: self.status_label.setText(msg))
         self._loader.progress.connect(self._update_loading_progress)
         self._loader.finished_ok.connect(self._on_model_loaded)
         self._loader.finished_err.connect(self._on_model_load_error)
@@ -1053,7 +977,7 @@ class AIAssistantDialog(QDialog):
             return
         # If same model is already loaded, do nothing
         if self.client.is_loaded() and self.client.model_name == key:
-            self.status_label.setText(f"✅ Model already loaded")
+            self.status_label.setText("Model already loaded")
             return
 
         # Unload current model before loading new one
@@ -1063,12 +987,12 @@ class AIAssistantDialog(QDialog):
         desc = self._describe_model_key(key)
         self._model_load_start_time = datetime.now()
         self.load_btn.setEnabled(False)
-        self.status_label.setText(f"⏳ Preparing {desc}…")
+        self.status_label.setText(f"Preparing {desc}...")
         QApplication.processEvents()
 
         # Disable chat input during loading
         self.user_input.setEnabled(False)
-        self.user_input.setPlaceholderText("⏳ Loading model... Please wait.")
+        self.user_input.setPlaceholderText("Loading model... Please wait.")
         send_btn = self.findChild(QPushButton, "send_btn")  # Assuming we set object name
         if send_btn:
             send_btn.setEnabled(False)
@@ -1083,14 +1007,14 @@ class AIAssistantDialog(QDialog):
         self.chat_display.append(
             f"<div style='margin:8px 0;padding:10px;background:#fff3e0;"
             f"border-left:3px solid #ff9800;border-radius:4px;'>"
-            f"<b style='color:#e65100;'>⏳ Loading Model:</b><br>"
+            f"<b style='color:#e65100;'>Loading Model:</b><br>"
             f"<div style='color:#000;margin-top:4px;'>Preparing {desc}... This may take a few minutes.</div></div>"
         )
         sb = self.chat_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 
         self._loader = ModelLoaderThread(self.client, key)
-        self._loader.progress.connect(lambda msg: self.status_label.setText(f"⏳ {msg}"))
+        self._loader.progress.connect(lambda msg: self.status_label.setText(msg))
         self._loader.progress.connect(self._update_loading_progress)
         self._loader.finished_ok.connect(self._on_model_loaded)
         self._loader.finished_err.connect(self._on_model_load_error)
@@ -1101,11 +1025,11 @@ class AIAssistantDialog(QDialog):
         # Replace the last loading message
         html = self.chat_display.toHtml()
         # Find and replace the loading div
-        if "⏳ Loading Model:" in html:
+        if "Loading Model:" in html:
             new_msg = (
                 f"<div style='margin:8px 0;padding:10px;background:#fff3e0;"
                 f"border-left:3px solid #ff9800;border-radius:4px;'>"
-                f"<b style='color:#e65100;'>⏳ Loading Model:</b><br>"
+                f"<b style='color:#e65100;'>Loading Model:</b><br>"
                 f"<div style='color:#000;margin-top:4px;'>{msg}</div></div>"
             )
             # Simple replacement - replace the entire loading div
@@ -1126,7 +1050,7 @@ class AIAssistantDialog(QDialog):
 
         # Keep timing visible in status areas after refresh.
         current_status = self.status_label.text() or ""
-        if current_status.startswith("✅ Model loaded:"):
+        if current_status.startswith("Model loaded:"):
             self.status_label.setText(f"{current_status} ({load_time_text})")
         if hasattr(self, 'model_info_label'):
             current_info = self.model_info_label.text() or ""
@@ -1135,7 +1059,7 @@ class AIAssistantDialog(QDialog):
 
         # Re-enable chat input
         self.user_input.setEnabled(True)
-        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows…")
+        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows...")
         send_btn = self.findChild(QPushButton, "send_btn")
         if send_btn:
             send_btn.setEnabled(True)
@@ -1151,7 +1075,7 @@ class AIAssistantDialog(QDialog):
         self.chat_display.append(
             f"<div style='margin:8px 0;padding:10px;background:#e8f5e8;"
             f"border-left:3px solid #4caf50;border-radius:4px;'>"
-            f"<b style='color:#2e7d32;'>✅ Model Loaded:</b><br>"
+            f"<b style='color:#2e7d32;'>Model Loaded:</b><br>"
             f"<div style='color:#000;margin-top:4px;'>{desc} is ready in <b>{load_time_text}</b>! You can now ask questions.</div></div>"
         )
         sb = self.chat_display.verticalScrollBar()
@@ -1159,12 +1083,12 @@ class AIAssistantDialog(QDialog):
 
     def _on_model_load_error(self, error):
         self.load_btn.setEnabled(True)
-        self.status_label.setText(f"❌ Error: {error}")
+        self.status_label.setText(f"Error: {error}")
         QMessageBox.warning(self, "Error", f"Failed to load model:\n{error}")
 
         # Re-enable chat input
         self.user_input.setEnabled(True)
-        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows…")
+        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows...")
         send_btn = self.findChild(QPushButton, "send_btn")
         if send_btn:
             send_btn.setEnabled(True)
@@ -1179,7 +1103,7 @@ class AIAssistantDialog(QDialog):
         self.chat_display.append(
             f"<div style='margin:8px 0;padding:10px;background:#ffebee;"
             f"border-left:3px solid #f44336;border-radius:4px;'>"
-            f"<b style='color:#c62828;'>❌ Model Load Failed:</b><br>"
+            f"<b style='color:#c62828;'>Model Load Failed:</b><br>"
             f"<div style='color:#000;margin-top:4px;'>{error}</div></div>"
         )
         sb = self.chat_display.verticalScrollBar()
@@ -1204,7 +1128,7 @@ class AIAssistantDialog(QDialog):
         # Restore saved selection if still available, else fallback.
         model_keys = {m["key"] for m in models}
         cfg = _load_ai_config()
-        saved = cfg.get("default_model", DEFAULT_MODEL)
+        saved = cfg.get("default_model")
         if saved in model_keys:
             target = saved
         elif self.selected_model_key in model_keys:
@@ -1226,7 +1150,7 @@ class AIAssistantDialog(QDialog):
             cfg["default_model"] = key
             _save_ai_config(cfg)
             desc = self.default_model_combo.currentText()
-            self.status_label.setText(f"💾 Default model saved: {desc}")
+            self.status_label.setText(f"Default model saved: {desc}")
             self.selected_model_key = key
             # Update main combo to match
             for i in range(self.model_combo.count()):
@@ -1234,25 +1158,39 @@ class AIAssistantDialog(QDialog):
                     self.model_combo.setCurrentIndex(i)
                     break
 
+    # AFTER
     def _refresh_table_context_list(self):
         if not hasattr(self, "table_context_list"):
             return
 
+        # Disconnect during population so setCheckState doesn't trigger sync per row
+        try:
+            self.table_context_list.itemChanged.disconnect(
+                self._sync_selected_tables_to_parent
+            )
+        except Exception:
+            pass
+
         self.table_context_list.clear()
         editor_tables = list(getattr(self.parent_editor, "uploaded_display_names", []) or [])
-        selected = set(getattr(self.parent_editor, "selected_tables_for_ai", []) or editor_tables)
+        selected = set(getattr(self.parent_editor, "selected_tables_for_ai", []) or [])
 
         if not editor_tables:
             self.table_context_list.addItem("No uploaded tables available")
             item = self.table_context_list.item(0)
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            item.setForeground(QColor("#b8b8b8" if self._is_dark_theme() else "#666666"))
             return
 
         for table_name in editor_tables:
             item = QListWidgetItem(table_name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if table_name in selected else Qt.CheckState.Unchecked)
+            item.setForeground(QColor("#ffffff" if self._is_dark_theme() else "#1f1f1f"))
             self.table_context_list.addItem(item)
+
+        # Reconnect â€” any checkbox change from here on syncs immediately to parent
+        self.table_context_list.itemChanged.connect(self._sync_selected_tables_to_parent)
 
     def _set_all_table_checks(self, state):
         if not hasattr(self, "table_context_list"):
@@ -1266,7 +1204,7 @@ class AIAssistantDialog(QDialog):
     def _get_selected_tables_for_ai(self):
         editor_tables = list(getattr(self.parent_editor, "uploaded_display_names", []) or [])
         if not hasattr(self, "table_context_list") or self.table_context_list.count() == 0:
-            return editor_tables
+            return []
 
         selected = []
         for i in range(self.table_context_list.count()):
@@ -1274,21 +1212,38 @@ class AIAssistantDialog(QDialog):
             if item.flags() & Qt.ItemFlag.ItemIsUserCheckable and item.checkState() == Qt.CheckState.Checked:
                 selected.append(item.text())
 
-        # If user clears all, fall back to all so the assistant remains usable.
-        return selected if selected else editor_tables
+        # Return only explicitly selected tables (no fallback to all)
+        return selected
 
     def _sync_selected_tables_to_parent(self):
         if self.parent_editor is None:
             return
         self.parent_editor.selected_tables_for_ai = self._get_selected_tables_for_ai()
 
+    def _apply_selected_tables(self):
+        self._sync_selected_tables_to_parent()
+        selected = list(getattr(self.parent_editor, "selected_tables_for_ai", []) or [])
+
+        if selected:
+            selected_html = "<br>".join(html.escape(name) for name in selected)
+            message = (
+                "<b>Selected tables for AI context:</b><br><br>"
+                f"{selected_html}"
+            )
+        else:
+            message = "No tables are currently selected for AI context."
+
+        QMessageBox.information(self, "AI Table Selection Applied", message)
+
     def _estimate_tokens(self, text: str) -> int:
         # Fast heuristic: most LLM tokenizers are roughly 3-4 chars/token on mixed text.
         return max(1, len(text) // 4)
 
     def _get_model_context_limit(self) -> int:
-        key = self.client.model_name or self.selected_model_key or DEFAULT_MODEL
-        return int(AVAILABLE_MODELS.get(key, {}).get("context_length", 4096))
+        loaded_context = int(getattr(self.client, "context_length", 0) or 0)
+        if loaded_context > 0:
+            return loaded_context
+        return 8192
 
     def _estimate_messages_tokens(self, messages: list) -> int:
         total = 0
@@ -1297,7 +1252,7 @@ class AIAssistantDialog(QDialog):
         return total
 
     def _desired_output_tokens(self, context_limit: int) -> int:
-        """Target output token budget for large SQL/Python responses."""
+        """Target output token budget for large SQL responses."""
         return max(512, min(4096, int(context_limit * 0.55)))
 
     def _get_prompt_budget_tiers(self, context_limit: int, mode_key: str) -> list[tuple[int, int]]:
@@ -1356,7 +1311,7 @@ class AIAssistantDialog(QDialog):
         history_trimmed = False
         while len(messages) > 2 and self._estimate_messages_tokens(messages) > target_prompt_budget:
             # Remove oldest user/assistant turn pair but keep system + latest user.
-            if len(messages) > 4:
+            if len(messages) >= 4:
                 del messages[1:3]
                 history_trimmed = True
             else:
@@ -1433,6 +1388,63 @@ class AIAssistantDialog(QDialog):
     def _extract_sql_candidates(self, response: str) -> list:
         return _extract_sql_candidates_from_text(response)
 
+    def _extract_cte_names(self, sql_text: str) -> set[str]:
+        return {
+            name.lower()
+            for name in re.findall(r"(?i)(?:WITH|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql_text or "")
+        }
+
+    def _build_explain_stmt_for_validation(self, stmt: str, table_sources: dict, cte_names: set[str]) -> str:
+        explain_stmt = stmt
+        physical_names = {
+            name.lower(): path
+            for name, path in (table_sources or {}).items()
+            if name.lower() not in (cte_names or set())
+        }
+
+        def repl(match):
+            keyword = match.group(1)
+            table_ref = match.group(2)
+            suffix = match.group(3) or ""
+            table_key = table_ref.lower()
+            if table_key in cte_names:
+                return match.group(0)
+            source_path = physical_names.get(table_key)
+            if not source_path:
+                return match.group(0)
+            return f"{keyword} read_parquet('{source_path}'){suffix}"
+
+        pattern = re.compile(
+            r"(?is)\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+            r"((?:\s+(?:AS\s+)?\"?[A-Za-z_][A-Za-z0-9_]*\"?)?)"
+        )
+        explain_stmt = pattern.sub(repl, explain_stmt)
+        return explain_stmt
+
+    def _guard_explain_stmt(self, explain_stmt: str, cte_names: set[str], table_sources: dict) -> str | None:
+        guard_patterns = [
+            "TRY_CAST(COALESCE AS DOUBLE)",
+            "TRY_CAST(FROM AS DOUBLE)",
+            "TRY_CAST(B. AS DOUBLE)",
+        ]
+        upper_stmt = (explain_stmt or "").upper()
+        for pattern in guard_patterns:
+            if pattern in upper_stmt:
+                return f"Rejected invalid validation SQL fragment: {pattern}"
+
+        for cte_name in (cte_names or set()):
+            cte_path_pattern = re.compile(
+                rf"(?i)read_parquet\('([^']*[\\/])?{re.escape(cte_name)}\.parquet'\)"
+            )
+            if cte_path_pattern.search(explain_stmt or ""):
+                return f"Rejected validation rewrite for CTE name: {cte_name}"
+
+            cte_source = (table_sources or {}).get(cte_name)
+            if cte_source and f"read_parquet('{cte_source}')" in (explain_stmt or ""):
+                return f"Rejected validation rewrite for CTE source: {cte_name}"
+
+        return None
+
     def _schema_validate_response(self, response: str) -> list:
         warnings = []
         editor = self.parent_editor
@@ -1470,24 +1482,23 @@ class AIAssistantDialog(QDialog):
                 table_l = table_ref.lower()
                 if selected_tables and table_l in uploaded_tables and table_l not in selected_tables:
                     warnings.append(
-                        f"⚠️ Table '{table_ref}' is referenced but not selected in AI table settings."
+                        f"âš ï¸ Table '{table_ref}' is referenced but not selected in AI table settings."
                     )
 
             # Binder-level validation catches wrong table/column names without running the query.
-            # Must resolve bare table names → read_parquet() since tables aren't registered in DuckDB.
+            # Must resolve bare table names â†’ read_parquet() since tables aren't registered in DuckDB.
             if stmt.upper().startswith("SELECT") or stmt.upper().startswith("WITH"):
                 try:
-                    explain_stmt = stmt
-                    for dname, ppath in table_sources.items():
-                        # Only replace table names that appear directly after FROM or JOIN,
-                        # never inside function call arguments (fixes read_parquet inside STRFTIME etc.)
-                        pattern = r'(?i)(?<=(FROM|JOIN)\s)' + re.escape(dname) + r'\b'
-                        explain_stmt = re.sub(
-                            r'(?i)(\bFROM\s+|\bJOIN\s+)' + re.escape(dname) + r'\b',
-                            lambda m, p=ppath: m.group(1) + f"read_parquet('{p}')",
-                            explain_stmt,
-                            flags=re.IGNORECASE,
-                        )
+                    cte_names = self._extract_cte_names(stmt)
+                    explain_stmt = self._build_explain_stmt_for_validation(stmt, table_sources, cte_names)
+                    logger.debug("Schema validation original stmt: %s", stmt)
+                    logger.debug("Schema validation detected CTE names: %s", sorted(cte_names))
+                    logger.debug("Schema validation table_sources: %s", table_sources)
+                    logger.debug("Schema validation explain_stmt: %s", explain_stmt)
+                    guard_error = self._guard_explain_stmt(explain_stmt, cte_names, table_sources)
+                    if guard_error:
+                        warnings.append(f"âš ï¸ Schema validation skipped: {guard_error}")
+                        continue
                     editor.conn.execute(f"EXPLAIN {explain_stmt}")
                 except Exception as e:
                     err_msg = str(e)
@@ -1504,25 +1515,26 @@ class AIAssistantDialog(QDialog):
                                 stmt,
                                 flags=re.IGNORECASE | re.DOTALL,
                             ).strip()
-                            # Re-resolve table names for EXPLAIN
-                            fixed_explain = fixed_stmt
-                            for dname2, pp2 in table_sources.items():
-                                fixed_explain = re.sub(
-                                    r'(?i)(\bFROM\s+|\bJOIN\s+)' + re.escape(dname2) + r'\b',
-                                    lambda m, p=pp2: m.group(1) + f"read_parquet('{p}')",
-                                    fixed_explain,
-                                    flags=re.IGNORECASE,
-                                )
+                            cte_names = self._extract_cte_names(fixed_stmt)
+                            fixed_explain = self._build_explain_stmt_for_validation(fixed_stmt, table_sources, cte_names)
+                            logger.debug("Schema validation fixed stmt: %s", fixed_stmt)
+                            logger.debug("Schema validation fixed detected CTE names: %s", sorted(cte_names))
+                            logger.debug("Schema validation fixed table_sources: %s", table_sources)
+                            logger.debug("Schema validation fixed explain_stmt: %s", fixed_explain)
+                            guard_error = self._guard_explain_stmt(fixed_explain, cte_names, table_sources)
+                            if guard_error:
+                                warnings.append(f"âš ï¸ Schema validation skipped: {guard_error}")
+                                continue
                             editor.conn.execute(f"EXPLAIN {fixed_explain}")
                             warnings.append(
-                                "⚠️ Invalid QUALIFY removed (QUALIFY requires a window function like "
+                                "âš ï¸ Invalid QUALIFY removed (QUALIFY requires a window function like "
                                 "ROW_NUMBER() OVER (...)). Auto-corrected SQL:\n"
                                 f"```sql\n{fixed_stmt}\n```"
                             )
                         except Exception:
-                            warnings.append(f"⚠️ Schema validation: {err_msg}")
+                            warnings.append(f"âš ï¸ Schema validation: {err_msg}")
                     else:
-                        warnings.append(f"⚠️ Schema validation: {err_msg}")
+                        warnings.append(f"âš ï¸ Schema validation: {err_msg}")
 
         # Deduplicate while preserving order
         dedup = []
@@ -1533,33 +1545,294 @@ class AIAssistantDialog(QDialog):
                 seen.add(w)
         return dedup
 
-    # ── Chat logic ────────────────────────────────────────────────────
+    # â”€â”€ Chat logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _normalize_table_match_text(self, text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+    def _sql_identifier_display(self, name: str) -> str:
+        """Render identifiers the way SQL should reference them."""
+        text = str(name or "")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+            return text
+        return '"' + text.replace('"', '""') + '"'
+
+    def _table_aliases_for_prompt(self, table_name: str, file_path: str = "") -> list:
+        """Build compact aliases so user terms map to actual selected table names."""
+        raw_values = {table_name}
+        if file_path:
+            raw_values.add(os.path.splitext(os.path.basename(file_path))[0])
+
+        aliases = set()
+        for raw in raw_values:
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            aliases.add(raw)
+            aliases.add(raw.replace("_", " "))
+            aliases.add(raw.replace("-", " "))
+            aliases.add(raw.replace("_", "").replace("-", ""))
+
+            norm = self._normalize_table_match_text(raw)
+            if norm:
+                aliases.add(norm)
+                if "2b" in norm:
+                    aliases.update(["2b", "2b file", "2b files", "gstr 2b", "gstr_2b", "gstr_2b_file"])
+                if norm.startswith("pr") or "purchase" in norm:
+                    aliases.update(["pr", "pr file", "pr files", "pr_file", "pr_files", "purchase register"])
+
+        aliases.discard(table_name)
+        return sorted(aliases, key=lambda x: (len(x), x))[:10]
+
+    def _selected_table_alias_map(self) -> dict:
+        """Return normalized alias -> selected table name for generated SQL repair."""
+        editor = self.parent_editor
+        selected_tables = self._get_selected_tables_for_ai()
+        display_to_path = {}
+
+        if hasattr(editor, "uploaded_files") and hasattr(editor, "uploaded_display_names"):
+            for i, fpath in enumerate(editor.uploaded_files or []):
+                if i < len(editor.uploaded_display_names or []):
+                    display_to_path[editor.uploaded_display_names[i]] = fpath
+
+        alias_candidates = {}
+        for table_name in selected_tables:
+            values = [table_name] + self._table_aliases_for_prompt(table_name, display_to_path.get(table_name, ""))
+            for value in values:
+                norm = self._normalize_table_match_text(value)
+                if norm:
+                    alias_candidates.setdefault(norm, set()).add(table_name)
+        return {
+            alias: next(iter(tables))
+            for alias, tables in alias_candidates.items()
+            if len(tables) == 1
+        }
+
+    def _selected_table_columns(self) -> dict:
+        """Return selected table -> ordered column names from schema."""
+        editor = self.parent_editor
+        selected_tables = self._get_selected_tables_for_ai()
+        display_to_path = {}
+        columns_map = {}
+
+        if hasattr(editor, "uploaded_files") and hasattr(editor, "uploaded_display_names"):
+            for i, fpath in enumerate(editor.uploaded_files or []):
+                if i < len(editor.uploaded_display_names or []):
+                    display_to_path[editor.uploaded_display_names[i]] = fpath
+
+        for table_name in selected_tables:
+            try:
+                fpath = display_to_path.get(table_name)
+                if not fpath:
+                    doc_dir = getattr(editor, "doc_dir", "")
+                    fpath = os.path.join(doc_dir, f"{table_name}.parquet")
+                source = f"read_parquet('{fpath.replace(chr(92), '/')}')"
+                cols = editor.conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+                columns_map[table_name] = [str(c[0]) for c in cols if c and c[0]]
+            except Exception:
+                columns_map[table_name] = []
+
+        return columns_map
+
+    def _rewrite_user_prompt_with_selected_tables(self, user_text: str) -> tuple[str, list]:
+        """Rewrite alias-like table references in the user prompt to actual selected tables."""
+        rewritten = user_text or ""
+        alias_map = self._selected_table_alias_map()
+        columns_map = self._selected_table_columns()
+        replacements = []
+
+        alias_items = []
+        for norm_alias, table_name in alias_map.items():
+            if norm_alias == self._normalize_table_match_text(table_name):
+                continue
+            for raw_alias in self._table_aliases_for_prompt(table_name):
+                if self._normalize_table_match_text(raw_alias) == norm_alias:
+                    # Skip ultra-short generic aliases in user-prompt rewriting so
+                    # column names like "2B Document No" are not partially rewritten.
+                    if len(raw_alias.strip()) < 4:
+                        continue
+                    alias_items.append((raw_alias, table_name))
+
+        seen_pairs = set()
+        alias_items = [
+            (alias, table_name)
+            for alias, table_name in alias_items
+            if not ((alias.lower(), table_name) in seen_pairs or seen_pairs.add((alias.lower(), table_name)))
+        ]
+        alias_items.sort(key=lambda item: len(item[0]), reverse=True)
+
+        for alias, table_name in alias_items:
+            pattern = re.compile(rf"(?i)(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])")
+            if pattern.search(rewritten):
+                rewritten = pattern.sub(table_name, rewritten)
+                replacements.append(f"{alias} -> {table_name}")
+
+        if not replacements:
+            return user_text, []
+
+        resolved_tables = []
+        seen_tables = set()
+        for item in replacements:
+            table_name = item.split("->", 1)[1].strip()
+            if table_name not in seen_tables:
+                resolved_tables.append(table_name)
+                seen_tables.add(table_name)
+
+        resolved_lines = []
+        for table_name in resolved_tables:
+            columns = columns_map.get(table_name, [])
+            if columns:
+                resolved_lines.append(
+                    f"- {table_name} columns: {', '.join(self._sql_identifier_display(col) for col in columns)}"
+                )
+            else:
+                resolved_lines.append(f"- {table_name} columns: (schema unavailable)")
+
+        rewritten = (
+            rewritten
+            + "\n\nResolved selected tables for this request:\n"
+            + "\n".join(resolved_lines)
+        )
+        return rewritten, replacements
+
+    def _resolve_generated_table_ref(self, table_ref: str) -> str | None:
+        """Resolve an invented table reference to a selected table when confidence is high."""
+        norm_ref = self._normalize_table_match_text(table_ref)
+        if not norm_ref:
+            return None
+
+        alias_map = self._selected_table_alias_map()
+        if norm_ref in alias_map:
+            return alias_map[norm_ref]
+
+        candidates = []
+        for table_name in self._get_selected_tables_for_ai():
+            norm_table = self._normalize_table_match_text(table_name)
+            if not norm_table:
+                continue
+            if norm_ref in norm_table or norm_table in norm_ref:
+                candidates.append(table_name)
+                continue
+            if "2b" in norm_ref and "2b" in norm_table:
+                candidates.append(table_name)
+                continue
+            if norm_ref.startswith("pr") and norm_table.startswith("pr"):
+                candidates.append(table_name)
+
+        unique = []
+        for candidate in candidates:
+            if candidate not in unique:
+                unique.append(candidate)
+        return unique[0] if len(unique) == 1 else None
+
+    def _repair_generated_table_refs(self, response: str) -> tuple[str, list]:
+        """Replace obvious hallucinated FROM/JOIN table names with selected table names."""
+        if not response:
+            return response, []
+
+        selected = set(self._get_selected_tables_for_ai())
+        uploaded = set(getattr(self.parent_editor, "uploaded_display_names", []) or [])
+        replacements = []
+
+        def repair_sql(sql_text: str) -> str:
+            cte_names = {
+                name.lower()
+                for name in re.findall(r"(?i)(?:WITH|,)\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql_text)
+            }
+
+            def repl(match):
+                keyword = match.group(1)
+                table_ref = match.group(2)
+                if table_ref in selected or table_ref in uploaded or table_ref.lower() in cte_names:
+                    return match.group(0)
+
+                resolved = self._resolve_generated_table_ref(table_ref)
+                if resolved and resolved != table_ref:
+                    replacements.append(f"{table_ref} -> {resolved}")
+                    return f"{keyword} {resolved}"
+                return match.group(0)
+
+            return re.sub(
+                r"(?i)\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                repl,
+                sql_text,
+            )
+
+        def block_repl(match):
+            return "```sql\n" + repair_sql(match.group(1)) + "```"
+
+        repaired = re.sub(r"```sql\s*(.*?)```", block_repl, response, flags=re.IGNORECASE | re.DOTALL)
+        if repaired == response:
+            repaired = repair_sql(response)
+
+        deduped = []
+        seen = set()
+        for item in replacements:
+            if item not in seen:
+                deduped.append(item)
+                seen.add(item)
+        return repaired, deduped
 
     def _add_welcome_message(self):
         model_name = self.client.model_name
-        desc = AVAILABLE_MODELS.get(model_name, {}).get("description", "")
+        desc = ""
+        for m in self.client.list_available_models():
+            if m["key"] == model_name:
+                desc = m["description"]
+                break
         if not desc:
-            # Custom / directly-placed model — find it in the full list
-            for m in self.client.list_available_models():
-                if m["key"] == model_name:
-                    desc = m["description"]
-                    break
-        if not desc:
-            # Last resort: derive a readable name from the key/filename
-            desc = model_name.replace("custom:", "").replace("-", " ").replace("_", " ").replace(".gguf", "")
+            desc = (model_name or "Unknown model").replace("-", " ").replace("_", " ").replace(".gguf", "")
         self.chat_display.setHtml(
             "<div style='padding:12px;background:#e8f5e9;border-radius:4px;color:#1b5e20;'>"
-            f"<b>🤖 Welcome to SimpliSQL AI Assistant</b><br>"
+            f"<b>Welcome to SimpliSQL AI Assistant</b><br>"
             f"Powered by local model: <b>{desc}</b><br><br>"
             "<i>You can ask me to:</i><br>"
-            "• Generate SQL queries (simple or complex)<br>"
-            "• Use subqueries, CTEs, window functions<br>"
-            "• Explain SQL syntax and DuckDB features<br>"
-            "• Optimize queries and suggest improvements<br>"
-            "• Help with data analysis and workflows<br><br>"
+            "- Generate SQL queries (simple or complex)<br>"
+            "- Use subqueries, CTEs, window functions<br>"
+            "- Explain SQL syntax and DuckDB features<br>"
+            "- Optimize queries and suggest improvements<br>"
+            "- Help with data analysis and workflows<br><br>"
             "<b>Note:</b> I can generate ANY valid DuckDB SQL query - don't hesitate to ask for complex operations!<br><br>"
-            "All processing happens locally – no data leaves your machine."
+            "All processing happens locally - no data leaves your machine."
             "</div>"
+        )
+
+    def _is_simple_chat_message(self, text: str) -> bool:
+        cleaned = re.sub(r"[^\w\s]", "", (text or "").strip().lower())
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned in {
+            "hi",
+            "hello",
+            "hey",
+            "hii",
+            "helo",
+            "good morning",
+            "good afternoon",
+            "good evening",
+            "thanks",
+            "thank you",
+            "ok",
+            "okay",
+        }
+
+    def _append_user_message(self, user_text: str):
+        safe_user = html.escape(user_text or "")
+        self.chat_display.append(
+            f"<div style='margin:8px 0;padding:10px;background:#e3f2fd;"
+            f"border-left:3px solid #2196F3;border-radius:4px;'>"
+            f"<b>You:</b><br><div style='color:#000;margin-top:4px;'>"
+            f"{safe_user}</div></div>"
+        )
+
+    def _append_ai_message(self, response: str):
+        safe_response = html.escape(response or "").replace("\n", "<br>")
+        self.chat_display.append(
+            f"<div style='margin:8px 0;padding:10px;background:#f1f8e9;"
+            f"border-left:3px solid #8bc34a;border-radius:4px;'>"
+            f"<b style='color:#558b2f;'>AI:</b><br>"
+            f"<div style='color:#000;margin-top:4px;white-space:pre-wrap;word-break:break-word;'>"
+            f"{safe_response}</div>"
+            f"</div>"
         )
 
     def send_message(self):
@@ -1569,7 +1842,7 @@ class AIAssistantDialog(QDialog):
                 sec = int((datetime.now() - self._generation_started_at).total_seconds())
                 elapsed = f" ({sec}s elapsed)"
             self._set_status_badge(
-                f"⏳ Generation already in progress{elapsed}. Click Stop or wait for completion.",
+                f"Generation already in progress{elapsed}. Click Stop or wait for completion.",
                 "busy",
             )
             return
@@ -1578,20 +1851,25 @@ class AIAssistantDialog(QDialog):
         if not user_text:
             return
 
+        if self._is_simple_chat_message(user_text):
+            self._append_user_message(user_text)
+            self.user_input.clear()
+            response = "Hi! Tell me what SQL query or data analysis you want to build."
+            self._append_ai_message(response)
+            sb = self.chat_display.verticalScrollBar()
+            sb.setValue(sb.maximum())
+            return
+
         if not self.client.is_loaded():
             QMessageBox.warning(self, "No Model",
                                 "Please load a local model first (click 'Load Model').")
             return
 
-        self.chat_display.append(
-            f"<div style='margin:8px 0;padding:10px;background:#e3f2fd;"
-            f"border-left:3px solid #2196F3;border-radius:4px;'>"
-            f"<b>You:</b><br><div style='color:#000;margin-top:4px;'>"
-            f"{user_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</div></div>"
-        )
+        self._append_user_message(user_text)
         self.user_input.clear()
+
         self.chat_display.append(
-            "<div style='margin:6px 0;font-style:italic;color:#888;'>⏳ Thinking…</div>"
+            "<div style='margin:6px 0;font-style:italic;color:#888;'>Thinking...</div>"
         )
         QApplication.processEvents()
 
@@ -1600,12 +1878,13 @@ class AIAssistantDialog(QDialog):
         mode_key = "sql"
         self._last_answer_mode = "sql"
         system_prompt = self._build_system_prompt()
+        ai_user_text, _prompt_table_repairs = self._rewrite_user_prompt_with_selected_tables(user_text)
 
         messages = [{"role": "system", "content": system_prompt}]
         for turn in self.current_conversation[-6:]:
             messages.append({"role": "user", "content": turn["user"]})
             messages.append({"role": "assistant", "content": turn["ai"]})
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": ai_user_text})
 
         # Guardrail: adapt prompt budget across higher tiers up to this model's max context.
         context_limit = self._get_model_context_limit()
@@ -1634,12 +1913,12 @@ class AIAssistantDialog(QDialog):
             messages = last_trial_messages
             compaction_notes = last_trial_notes
             html = self.chat_display.toHtml()
-            html = html.replace("⏳ Thinking…", "")
+            html = html.replace("â³ Thinkingâ€¦", "")
             self.chat_display.setHtml(html)
             self.chat_display.append(
                 "<div style='margin:8px 0;padding:10px;background:#ffebee;"
                 "border-left:3px solid #f44336;border-radius:4px;'>"
-                "<b style='color:#b71c1c;'>❌ Prompt too large for current model context.</b><br>"
+                "<b style='color:#b71c1c;'>Prompt too large for current model context.</b><br>"
                 "<div style='color:#000;margin-top:4px;'>"
                 "Reached this model's maximum context limit after adaptive expansion. "
                 "Reduce selected tables/current-query context, or switch to a higher-context model."
@@ -1677,7 +1956,7 @@ class AIAssistantDialog(QDialog):
             self.chat_display.append(
                 "<div style='margin:8px 0;padding:10px;background:#fff8e1;"
                 "border-left:3px solid #ffb300;border-radius:4px;'>"
-                "<b style='color:#8d6e00;'>⚠️ Context adjusted for large request:</b><br>"
+                "<b style='color:#8d6e00;'>Context adjusted for large request:</b><br>"
                 f"<div style='color:#000;margin-top:4px;'>{safe_notes}</div>"
                 "</div>"
             )
@@ -1688,15 +1967,30 @@ class AIAssistantDialog(QDialog):
         self._start_generation_status()
         self._streaming_buffer = []          # accumulates streamed tokens
         self._streaming_block_inserted = False
+        selected_tables = self._get_selected_tables_for_ai()
+
         self._chat_thread = AIChatThread(
             self.client,
             messages,
             user_request=user_text,
             answer_mode=mode_key,
         )
+        
+        print("\n" + "=" * 80)
+        print("FINAL MESSAGES SENT TO AI")
+        print("=" * 80)
+
+        for i, msg in enumerate(messages):
+            print(f"\nMESSAGE {i}")
+            print("ROLE:", msg["role"])
+            print(msg["content"][:10000])
+
+        print("=" * 80)
+
         self._chat_thread.token_ready.connect(self._on_token_ready)
         self._chat_thread.response_ready.connect(self._on_ai_response)
         self._chat_thread.error_occurred.connect(self._on_ai_error)
+        self._chat_thread.finished.connect(self._on_chat_thread_finished)
         self._set_generation_controls(True)
         self._chat_thread.start()
 
@@ -1723,11 +2017,11 @@ class AIAssistantDialog(QDialog):
 
     def _start_generation_status(self):
         self._generation_started_at = datetime.now()
-        self._set_status_badge("⏳ Generating... 0s (click Stop to cancel)", "busy")
+        self._set_status_badge("Generating... 0s (click Stop to cancel)", "busy")
         if hasattr(self, "_generation_status_timer"):
             self._generation_status_timer.start()
 
-    def _stop_generation_status(self, text: str = "🟢 Ready", level: str = "ready"):
+    def _stop_generation_status(self, text: str = "Ready", level: str = "ready"):
         if hasattr(self, "_generation_status_timer"):
             self._generation_status_timer.stop()
         self._generation_started_at = None
@@ -1739,41 +2033,45 @@ class AIAssistantDialog(QDialog):
                 self._generation_status_timer.stop()
             return
         sec = int((datetime.now() - self._generation_started_at).total_seconds())
-        self._set_status_badge(f"⏳ Generating... {sec}s (click Stop to cancel)", "busy")
+        self._set_status_badge(f"Generating... {sec}s (click Stop to cancel)", "busy")
 
     def _stop_generation(self):
         if self._chat_thread is None or not self._chat_thread.isRunning():
             return
 
         self._generation_cancelled = True
-        self._chat_thread.requestInterruption()
-        # Best-effort immediate stop; if generation is inside a blocking model call,
-        # we still ignore any late response in _on_ai_response.
-        self._chat_thread.terminate()
-        self._chat_thread.wait(300)
+        # Politely request interruption. Avoid calling terminate() which can
+        # destabilize the interpreter or the Qt event loop; rely on the
+        # worker to check isInterruptionRequested() and exit cleanly.
+        try:
+            self._chat_thread.requestInterruption()
+        except Exception:
+            pass
 
         html = self.chat_display.toHtml()
-        html = html.replace("⏳ Thinking…", "")
+        html = html.replace("Thinking...", "")
         self.chat_display.setHtml(html)
         self.chat_display.append(
             "<div style='margin:8px 0;padding:10px;background:#fff8e1;"
             "border-left:3px solid #ffb300;border-radius:4px;'>"
-            "<b style='color:#8d6e00;'>⏹️ Generation stopped.</b></div>"
+            "<b style='color:#8d6e00;'>Generation stopped.</b></div>"
         )
+        # Immediately update controls; thread will clear _chat_thread when it
+        # naturally ends or emits response/error.
         self._set_generation_controls(False)
-        self._stop_generation_status("⏹️ Generation stopped by user.", "info")
+        self._stop_generation_status("Generation stopped by user.", "info")
 
     def _on_token_ready(self, token: str):
-        """Called for each streamed token – appends incrementally without full repaint."""
+        """Called for each streamed token â€“ appends incrementally without full repaint."""
         if self._generation_cancelled:
             return
 
         self._streaming_buffer.append(token)
 
         if not self._streaming_block_inserted:
-            # Remove the ⏳ Thinking… placeholder (one-time setHtml is acceptable here)
+            # Remove the Thinking... placeholder (one-time setHtml is acceptable here)
             html = self.chat_display.toHtml()
-            html = html.replace("⏳ Thinking…", "")
+            html = html.replace("Thinking...", "")
             self.chat_display.setHtml(html)
 
             # Insert the AI header block using cursor (no full repaint)
@@ -1807,65 +2105,66 @@ class AIAssistantDialog(QDialog):
         if self._generation_cancelled:
             self._generation_cancelled = False
             self._chat_thread = None
-            self._stop_generation_status("⏹️ Generation stopped by user.", "info")
+            self._stop_generation_status("Generation stopped by user.", "info")
             return
 
+        response, table_repairs = self._repair_generated_table_refs(response)
+        elapsed = (datetime.now() - getattr(self, '_response_start_time', datetime.now())).total_seconds()
+
+        # 1. Run our DuckDB syntax and binder validation checks
         schema_warnings = self._schema_validate_response(response)
         if schema_warnings:
-            response = response + "\n\n---\n🔎 Schema checks:\n" + "\n".join(schema_warnings)
+            response = response + "\n\n---\nSchema checks:\n" + "\n".join(schema_warnings)
+        pure_sql_candidates = self._extract_sql_candidates(response)
+        self._stop_generation_status(f"Response complete in {elapsed:.1f}s", "ready")
 
-        # The streaming tokens were already rendered incrementally via _on_token_ready.
-        # Only do a full render if streaming never started (fallback) or if the response
-        # was modified after streaming (e.g. schema warnings appended).
-        streamed_text = "".join(self._streaming_buffer)
-        html = self.chat_display.toHtml()
-        html = html.replace("⏳ Thinking…", "")
-        self.chat_display.setHtml(html)
+        auto_paste = getattr(self, 'auto_paste_check', None)
+        auto_pasted = False
+        if auto_paste and auto_paste.isChecked() and pure_sql_candidates:
+            sql = pure_sql_candidates[-1].strip()
+            if sql:
+                editor = self.parent_editor
+                if hasattr(editor, 'switch_notepad_mode'):
+                    editor.switch_notepad_mode("sql")
+                editor.sql_text.setPlainText(sql)
+                auto_pasted = True
+        QApplication.processEvents()
 
+        # 3. Clean the display and push the unified canonical response block
+        # This completely bypasses the fragile string matching/stitching bugs
         if not self._streaming_block_inserted:
-            # Streaming never fired — render the full response now
-            safe = response.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+            html = self.chat_display.toHtml()
+            html = html.replace("Thinking...", "")
+            self.chat_display.setHtml(html)
+
+        # Only append the full response if streaming never fired
+        # (If streaming fired, tokens were already displayed incrementally)
+        if not self._streaming_block_inserted:
+            safe_final = response.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
             self.chat_display.append(
                 f"<div style='margin:8px 0;padding:10px;background:#f1f8e9;"
                 f"border-left:3px solid #8bc34a;border-radius:4px;'>"
                 f"<b style='color:#558b2f;'>AI:</b><br>"
                 f"<div style='color:#000;margin-top:4px;white-space:pre-wrap;word-break:break-word;'>"
-                f"{safe}</div>"
+                f"{safe_final}</div>"
                 f"</div>"
             )
-        elif response != streamed_text:
-            # Response was modified after streaming (continuation stitching, schema notes, etc.).
-            # If streaming output is a prefix of the final response, append only the tail.
-            if response.startswith(streamed_text):
-                extra = response[len(streamed_text):].strip()
-                if extra:
-                    safe_extra = extra.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
-                    self.chat_display.append(
-                        f"<div style='margin:4px 0 8px 0;padding:8px;background:#fff8e1;"
-                        f"border-left:3px solid #ffb300;border-radius:4px;color:#555;font-size:0.95em;'>"
-                        f"{safe_extra}</div>"
-                    )
-            else:
-                # Streaming text differs from canonical final output; show canonical block.
-                safe_final = response.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
-                self.chat_display.append(
-                    f"<div style='margin:8px 0;padding:10px;background:#f1f8e9;"
-                    f"border-left:3px solid #8bc34a;border-radius:4px;'>"
-                    f"<b style='color:#558b2f;'>AI (Final):</b><br>"
-                    f"<div style='color:#000;margin-top:4px;white-space:pre-wrap;word-break:break-word;'>"
-                    f"{safe_final}</div>"
-                    f"</div>"
-                )
+
+        if table_repairs:
+            safe_repairs = ", ".join(table_repairs).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            self.chat_display.append(
+                "<div style='margin:4px 0 6px 0;padding:6px 10px;background:#e3f2fd;"
+                "border-left:3px solid #2196F3;border-radius:4px;color:#0d47a1;font-size:0.9em;'>"
+                f"Table names matched to selected files: {safe_repairs}</div>"
+            )
         
         sb = self.chat_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-        # Show response time
-        elapsed = (datetime.now() - getattr(self, '_response_start_time', datetime.now())).total_seconds()
+        # 4. Log performance metrics
         self.chat_display.append(
-            f"<div style='margin:0 0 6px 0;color:#2e7d32;font-size:0.85em;text-align:right;'>✅ Done · ⏱ {elapsed:.1f}s</div>"
+            f"<div style='margin:0 0 6px 0;color:#2e7d32;font-size:0.85em;text-align:right;'>Done - {elapsed:.1f}s</div>"
         )
-        self._stop_generation_status(f"✅ Response complete in {elapsed:.1f}s", "ready")
         sb.setValue(sb.maximum())
 
         self.current_conversation.append({
@@ -1874,32 +2173,22 @@ class AIAssistantDialog(QDialog):
             "timestamp": datetime.now().isoformat(),
         })
 
-        # ── Auto-paste (Milestone 2) ──────────────────────────────────
-        auto_paste = getattr(self, 'auto_paste_check', None)
-        if auto_paste and auto_paste.isChecked():
-            last_mode = getattr(self, '_last_answer_mode', 'sql')
-            editor = self.parent_editor
-            if last_mode == "sql":
-                sql_candidates = self._extract_sql_candidates(response)
-                if sql_candidates:
-                    sql = sql_candidates[-1].strip()
-                    if sql:
-                        if hasattr(editor, 'switch_notepad_mode'):
-                            editor.switch_notepad_mode("sql")
-                        editor.sql_text.setPlainText(sql)
-                        self.chat_display.append(
-                            "<div style='margin:4px 0 6px 0;padding:6px 10px;background:#e3f2fd;"
-                            "border-left:3px solid #2196F3;border-radius:4px;color:#0d47a1;font-size:0.9em;'>"
-                            "🗃️ SQL query auto-pasted to <b>SQL Notepad</b>.</div>"
-                        )
+        # 5. Auto-paste confirmation note
+        if auto_pasted:
+            self.chat_display.append(
+                "<div style='margin:4px 0 6px 0;padding:6px 10px;background:#e3f2fd;"
+                "border-left:3px solid #2196F3;border-radius:4px;color:#0d47a1;font-size:0.9em;'>"
+                "SQL query auto-pasted to <b>SQL Notepad</b>.</div>"
+            )
+            sb.setValue(sb.maximum())
 
         self._chat_thread = None
 
     def _on_ai_error(self, error):
         self._set_generation_controls(False)
-        self._stop_generation_status("❌ Generation failed. See error in chat.", "error")
+        self._stop_generation_status("Generation failed. See error in chat.", "error")
         html = self.chat_display.toHtml()
-        html = html.replace("⏳ Thinking…", "")
+        html = html.replace("Thinking...", "")
         self.chat_display.setHtml(html)
 
         self.chat_display.append(
@@ -1909,6 +2198,10 @@ class AIAssistantDialog(QDialog):
             f"<div style='color:#000;margin-top:4px;'>{error}</div></div>"
         )
         self._chat_thread = None
+
+    def _on_chat_thread_finished(self):
+        if self._chat_thread is not None and not self._chat_thread.isRunning():
+            self._chat_thread = None
 
     def _copy_last_sql_to_editor(self):
         """Extract the last SQL query from the chat and copy it to the main SQL editor."""
@@ -1983,19 +2276,19 @@ class AIAssistantDialog(QDialog):
             try:
                 # Try to read and get sample from the file
                 if path.endswith('.parquet'):
-                    query = f"SELECT * FROM read_parquet('{path}') LIMIT 3"
+                    query = f"SELECT * FROM read_parquet('{path}') LIMIT 1"
                 elif path.endswith('.csv'):
-                    query = f"SELECT * FROM read_csv_auto('{path}') LIMIT 3"
+                    query = f"SELECT * FROM read_csv_auto('{path}') LIMIT 1"
                 elif path.endswith('.json'):
-                    query = f"SELECT * FROM read_json_auto('{path}') LIMIT 3"
+                    query = f"SELECT * FROM read_json_auto('{path}') LIMIT 1"
                 else:
                     # Try auto-detection
-                    query = f"SELECT * FROM '{path}' LIMIT 3"
+                    query = f"SELECT * FROM '{path}' LIMIT 1"
                 
                 rows = editor.conn.execute(query).fetchall()
                 if rows:
                     # Get column names
-                    col_query = f"DESCRIBE SELECT * FROM read_parquet('{path}')" if path.endswith('.parquet') else query.replace('LIMIT 3', 'LIMIT 0')
+                    col_query = f"DESCRIBE SELECT * FROM read_parquet('{path}')" if path.endswith('.parquet') else query.replace('LIMIT 1', 'LIMIT 0')
                     try:
                         cols = editor.conn.execute(col_query).fetchall()
                         col_names = [c[0] for c in cols]
@@ -2011,23 +2304,21 @@ class AIAssistantDialog(QDialog):
         
         return samples
 
-    def _build_python_system_prompt(self) -> str:
-        """SQL-only mode keeps Python prompt routing disabled."""
-        return self._build_system_prompt()
 
     def _build_system_prompt(self) -> str:
         """Build a compact, schema-aware system prompt for the AI model."""
 
-        # ── 1. Gather table schema & mappings FIRST (most important data) ──
+        # â”€â”€ 1. Gather table schema & mappings FIRST (most important data) â”€â”€
         schema_lines = []
         sample_parts = []
         table_mapping_lines = []
+        alias_lines = []
         editor = self.parent_editor
         selected_tables = self._get_selected_tables_for_ai()
         display_to_path = {}
 
         if hasattr(editor, 'conn') and hasattr(editor, 'uploaded_display_names'):
-            # Build display-name → file-path lookup
+            # Build display-name â†’ file-path lookup
             if hasattr(editor, 'uploaded_files') and editor.uploaded_files:
                 for i, fpath in enumerate(editor.uploaded_files):
                     if i < len(editor.uploaded_display_names):
@@ -2047,7 +2338,7 @@ class AIAssistantDialog(QDialog):
                 # Schema
                 try:
                     cols = editor.conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
-                    col_list = ", ".join(f"{c[0]} ({c[1]})" for c in cols)
+                    col_list = ", ".join(f"{self._sql_identifier_display(c[0])} ({c[1]})" for c in cols)
                     schema_lines.append(f"  {table_name}: {col_list}")
                 except Exception:
                     schema_lines.append(f"  {table_name}: (schema unavailable)")
@@ -2057,18 +2348,22 @@ class AIAssistantDialog(QDialog):
                 if fpath:
                     table_mapping_lines.append(f"  {table_name} -> {fpath.replace(chr(92), '/')}")
 
-                # Sample rows (max 3 per table, compact CSV format)
+                aliases = self._table_aliases_for_prompt(table_name, fpath or "")
+                if aliases:
+                    alias_lines.append(f"  {table_name}: {', '.join(aliases)}")
+
+                # Sample rows (max 1 per table, compact CSV format)
                 try:
                     col_names = [d[0] for d in editor.conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()]
-                    rows = editor.conn.execute(f"SELECT * FROM {source} LIMIT 3").fetchall()
+                    rows = editor.conn.execute(f"SELECT * FROM {source} LIMIT 1").fetchall()
                     if rows:
-                        header = ", ".join(col_names)
+                        header = ", ".join(self._sql_identifier_display(col) for col in col_names)
                         data_lines = [", ".join(str(v) for v in r) for r in rows]
                         sample_parts.append(f"{table_name}:\n  {header}\n  " + "\n  ".join(data_lines))
                 except Exception:
                     pass
 
-        # ── 2. Build compact system prompt ──
+        # â”€â”€ 2. Build compact system prompt â”€â”€
         parts = []
 
         # Core identity + critical rules (kept tight)
@@ -2076,19 +2371,26 @@ class AIAssistantDialog(QDialog):
             "You are a DuckDB SQL assistant for SimpliSQL.\n"
             "RULES:\n"
             "- ONLY use tables/columns listed below. Never invent names.\n"
+            "- If a column name contains spaces, starts with a number, or includes special characters, reference it exactly with double quotes, for example \"2B Document No\".\n"
+            "- If the user says PR files, gstr_2b_file, 2B file, or similar wording, match it to the closest selected table filename in TABLE ALIASES. Do not create table names from the user's wording.\n"
+            "- If a CTE or subquery renames columns with AS, all later references to that CTE/subquery MUST use the renamed output columns, not the original source column names. Example: if a CTE selects \"PR Vendor GSTIN\" AS pr_vendor_gstin, later joins must use cte_alias.pr_vendor_gstin, not cte_alias.\"PR Vendor GSTIN\".\n"
             "- Use DuckDB syntax.\n"
             "- For date/time questions, ALWAYS use DuckDB date/time functions and INTERVAL syntax.\n"
             "- Prefer explicit casting for mixed text/date columns: TRY_CAST(col AS DATE) or TRY_CAST(col AS TIMESTAMP).\n"
             "- 'total'/'sum' requests MUST use SUM() aggregate. 'count' uses COUNT(). 'average' uses AVG().\n"
             "- When grouping, all non-aggregated columns MUST appear in GROUP BY.\n"
             "- QUALIFY is ONLY for filtering window function results (e.g. ROW_NUMBER() OVER (...)). NEVER use QUALIFY without a window function (OVER keyword). For normal filters use WHERE or HAVING.\n"
-            "- QUALIFY must come AFTER GROUP BY and HAVING (clause order: FROM→WHERE→GROUP BY→HAVING→QUALIFY→ORDER BY).\n"
+            "- QUALIFY must come AFTER GROUP BY and HAVING (clause order: FROMâ†’WHEREâ†’GROUP BYâ†’HAVINGâ†’QUALIFYâ†’ORDER BY).\n"
             "- Use simple table names in queries, not file paths or read_parquet().\n"
             "- If a table is not listed, tell the user to upload it.\n"
             "- 'last'/'first' = ordering (ROW_NUMBER, arg_max), NOT MAX/MIN.\n"
             "- 'all X last Y' = PARTITION BY X ORDER BY ... DESC with ROW_NUMBER()=1.\n"
             "- DuckDB can query files directly: SELECT * FROM 'path/file.csv'\n"
-            "- Return ONE complete SQL query in a single ```sql``` block ending with ';'. Never use ellipsis ('...') or placeholders.\n"
+            "- If the user requests export to a file path, generate a COPY statement: COPY (<query>) TO '<path>' (HEADER, DELIMITER ',');\n"
+            "- Use the exact file paths and filenames the user provides. Do not invent alternate paths or rename the output files.\n"
+            "- If the user provides multiple export targets or asks for multiple output files, create a single reusable view or CTE and then emit multiple COPY statements for each target in the same SQL script.\n"
+            "- Example for multiple exports: CREATE OR REPLACE VIEW final_recon AS (...); COPY (SELECT * FROM final_recon WHERE condition1) TO '.../mismatch.csv' (HEADER, DELIMITER ','); COPY (SELECT * FROM final_recon WHERE condition2) TO '.../nomatch.csv' (HEADER, DELIMITER ',');\n"
+            "- Return ONE complete SQL script in a single ```sql``` block ending with ';'. Never use ellipsis ('...') or placeholders.\n"
             "GROUPING SIGNALS:\n"
             "- 'each X', 'per X', 'for every X', 'by X level' = needs GROUP BY X or PARTITION BY X.\n"
             "- 'last/first per group' = use ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) with QUALIFY or subquery.\n"
@@ -2105,12 +2407,15 @@ class AIAssistantDialog(QDialog):
         if table_mapping_lines:
             parts.append("TABLE PATHS:\n" + "\n".join(table_mapping_lines))
 
+        if alias_lines:
+            parts.append("TABLE ALIASES (user wording -> actual table):\n" + "\n".join(alias_lines))
+
         # Sample data (budget-controlled)
         context_limit = self._get_model_context_limit()
         prompt_budget = max(1200, context_limit - 700)
 
         if sample_parts:
-            sample_block = "SAMPLES (3 rows each):\n" + "\n".join(sample_parts)
+            sample_block = "SAMPLES (1 row each):\n" + "\n".join(sample_parts)
             candidate = "\n\n".join(parts) + "\n\n" + sample_block
             if self._estimate_tokens(candidate) <= prompt_budget:
                 parts.append(sample_block)
@@ -2119,7 +2424,7 @@ class AIAssistantDialog(QDialog):
         parts.append(
             "DUCKDB QUICK REFERENCE:\n"
             "- QUALIFY: ONLY for window function results. Example: QUALIFY ROW_NUMBER() OVER (PARTITION BY x ORDER BY y DESC) = 1\n"
-            "  DO NOT use QUALIFY for plain column filters — use WHERE or HAVING instead.\n"
+            "  DO NOT use QUALIFY for plain column filters â€” use WHERE or HAVING instead.\n"
             "- arg_max(val, order), arg_min(val, order): value at max/min of order col\n"
             "- DATE/TIME (DuckDB):\n"
             "  date_trunc('month', ts_col), extract('year' FROM ts_col), strftime(ts_col, '%Y-%m')\n"
@@ -2180,3 +2485,4 @@ class AIAssistantDialog(QDialog):
         else:
             event.ignore()
             self.hide()
+
