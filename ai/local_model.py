@@ -22,6 +22,27 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CONTEXT_LENGTH = 8192
+CONTEXT_FALLBACK_SEQUENCE = (65536, 32768, 18432, 8192)
+
+
+def _build_context_retry_sequence(primary_ctx: int, configured_ctx_length: int) -> list[int]:
+    """Build a descending list of safe retry context sizes."""
+    sequence = []
+    seen = set()
+
+    for value in [primary_ctx, *CONTEXT_FALLBACK_SEQUENCE, configured_ctx_length, DEFAULT_CONTEXT_LENGTH]:
+        try:
+            ctx = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ctx < 512 or ctx in seen:
+            continue
+        seen.add(ctx)
+        sequence.append(ctx)
+
+    return sorted(sequence, reverse=True)
+
 
 class GenerationCancelled(Exception):
     """Raised when a local generation is cancelled by the caller."""
@@ -47,8 +68,6 @@ def _fix_llama_dll_path():
         logger.warning(f"llama_cpp lib dir not found in bundle: {lib_dir}")
 
 _fix_llama_dll_path()
-
-DEFAULT_CONTEXT_LENGTH = 8192
 
 
 def get_models_dir() -> Path:
@@ -233,34 +252,34 @@ class LocalModelClient:
                 except Exception:
                     pass
 
-            try:
-                self.llm = Llama(
-                    model_path=model_path,
-                    n_ctx=ctx_length,
-                    n_threads=os.cpu_count() or 4,
-                    flash_attn=use_flash_attn,
-                    verbose=False,
-                )
-                logger.info(f"Loaded {resolved_key} with context={ctx_length}")
-            except Exception as load_error:
-                fallback_ctx = int(configured_ctx_length or DEFAULT_CONTEXT_LENGTH)
-                if ctx_length <= fallback_ctx:
-                    raise
-                logger.warning(
-                    f"Failed to load {resolved_key} with context={ctx_length}: {load_error}. "
-                    f"Retrying with context={fallback_ctx}."
-                )
-                if progress_callback:
-                    progress_callback(
-                        f"Large context load failed; retrying with {fallback_ctx} token context..."
+            last_error = None
+            retry_contexts = _build_context_retry_sequence(ctx_length, configured_ctx_length)
+            for attempt_index, attempt_ctx in enumerate(retry_contexts):
+                try:
+                    if attempt_index > 0:
+                        logger.warning(
+                            f"Retrying {resolved_key} with reduced context={attempt_ctx} after load failure: {last_error}"
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                f"Large context load failed; retrying with {attempt_ctx} token context..."
+                            )
+
+                    self.llm = Llama(
+                        model_path=model_path,
+                        n_ctx=attempt_ctx,
+                        n_threads=os.cpu_count() or 4,
+                        flash_attn=use_flash_attn,
+                        verbose=False,
                     )
-                self.llm = Llama(
-                    model_path=model_path,
-                    n_ctx=fallback_ctx,
-                    n_threads=os.cpu_count() or 4,
-                    flash_attn=use_flash_attn,
-                    verbose=False,
-                )
+                    ctx_length = attempt_ctx
+                    logger.info(f"Loaded {resolved_key} with context={ctx_length}")
+                    break
+                except Exception as load_error:
+                    last_error = load_error
+                    self.llm = None
+            else:
+                raise last_error
             self.model_name = resolved_key
             self.model_path = model_path
             self.context_length = int(

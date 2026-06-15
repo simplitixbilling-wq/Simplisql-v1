@@ -464,7 +464,7 @@ class AIAssistantDialog(QDialog):
         super().__init__(parent_editor)
         self.parent_editor = parent_editor
         self.current_conversation = []
-        self.setWindowTitle("ðŸ¤– AI Assistant (Local Model)")
+        self.setWindowTitle("AI Assistant (Local Model)")
 
         # Core client
         self.client = shared_client if shared_client is not None else LocalModelClient()
@@ -728,16 +728,16 @@ class AIAssistantDialog(QDialog):
         dl.addWidget(QLabel("<b>Default Model (auto-loads on app start)</b>"))
         self.default_model_combo = QComboBox()
         self._refresh_default_model_combo()
-        save_default_btn = QPushButton("ðŸ’¾ Save as Default")
-        save_default_btn.setStyleSheet(
+        self.save_default_btn = QPushButton("Save as Default")
+        self.save_default_btn.setStyleSheet(
             "QPushButton{background:#2196F3;color:white;font-weight:bold;padding:7px 16px 9px 16px;border-radius:4px;border:1px solid #0d47a1;border-bottom:3px solid #0d47a1;}"
             "QPushButton:hover{background:#1e88e5;}"
             "QPushButton:pressed{background:#1565c0;padding:8px 16px 8px 16px;border-bottom:1px solid #0d47a1;}"
         )
-        save_default_btn.clicked.connect(self._save_default_model)
+        self.save_default_btn.clicked.connect(self._save_default_model)
         drow = QHBoxLayout()
         drow.addWidget(self.default_model_combo)
-        drow.addWidget(save_default_btn)
+        drow.addWidget(self.save_default_btn)
         dl.addLayout(drow)
         lay.addWidget(df)
 
@@ -916,6 +916,39 @@ class AIAssistantDialog(QDialog):
     def _on_model_combo_changed(self):
         self.selected_model_key = self.model_combo.currentData()
 
+    def _set_model_loading_ui(self, is_loading: bool, status_text: str | None = None):
+        """Lock selectors and chat controls while model loading is in progress."""
+        if status_text is not None:
+            self.status_label.setText(status_text)
+
+        self.load_btn.setEnabled(not is_loading)
+        self.model_combo.setEnabled((not is_loading) and self.model_combo.count() > 0)
+
+        if hasattr(self, "default_model_combo"):
+            has_default_models = (
+                self.default_model_combo.count() > 0
+                and self.default_model_combo.itemData(0) is not None
+            )
+            self.default_model_combo.setEnabled((not is_loading) and has_default_models)
+
+        if hasattr(self, "save_default_btn"):
+            self.save_default_btn.setEnabled(not is_loading)
+
+        self.user_input.setEnabled(not is_loading)
+        self.user_input.setPlaceholderText(
+            "Loading model... Please wait." if is_loading else "Ask about SQL, data, or workflows..."
+        )
+
+        send_btn = self.findChild(QPushButton, "send_btn")
+        if send_btn:
+            send_btn.setEnabled(not is_loading)
+        clear_btn = self.findChild(QPushButton, "clear_btn")
+        if clear_btn:
+            clear_btn.setEnabled(not is_loading)
+        copy_btn = self.findChild(QPushButton, "copy_btn")
+        if copy_btn:
+            copy_btn.setEnabled(not is_loading)
+
     def _auto_load_default(self):
         """Auto-load the default model in background on startup."""
         models = self.client.list_available_models()
@@ -931,22 +964,8 @@ class AIAssistantDialog(QDialog):
 
         desc = self._describe_model_key(key)
         self._model_load_start_time = datetime.now()
-        self.status_label.setText("Loading model into memory...")
-        self.load_btn.setEnabled(False)
+        self._set_model_loading_ui(True, "Loading model into memory...")
         QApplication.processEvents()
-
-        # Disable chat input during loading
-        self.user_input.setEnabled(False)
-        self.user_input.setPlaceholderText("Loading model... Please wait.")
-        send_btn = self.findChild(QPushButton, "send_btn")
-        if send_btn:
-            send_btn.setEnabled(False)
-        clear_btn = self.findChild(QPushButton, "clear_btn")
-        if clear_btn:
-            clear_btn.setEnabled(False)
-        copy_btn = self.findChild(QPushButton, "copy_btn")
-        if copy_btn:
-            copy_btn.setEnabled(False)
 
         # Show loading message in chat
         self.chat_display.append(
@@ -986,22 +1005,8 @@ class AIAssistantDialog(QDialog):
 
         desc = self._describe_model_key(key)
         self._model_load_start_time = datetime.now()
-        self.load_btn.setEnabled(False)
-        self.status_label.setText(f"Preparing {desc}...")
+        self._set_model_loading_ui(True, f"Preparing {desc}...")
         QApplication.processEvents()
-
-        # Disable chat input during loading
-        self.user_input.setEnabled(False)
-        self.user_input.setPlaceholderText("Loading model... Please wait.")
-        send_btn = self.findChild(QPushButton, "send_btn")  # Assuming we set object name
-        if send_btn:
-            send_btn.setEnabled(False)
-        clear_btn = self.findChild(QPushButton, "clear_btn")
-        if clear_btn:
-            clear_btn.setEnabled(False)
-        copy_btn = self.findChild(QPushButton, "copy_btn")
-        if copy_btn:
-            copy_btn.setEnabled(False)
 
         # Show loading message in chat
         self.chat_display.append(
@@ -1042,7 +1047,7 @@ class AIAssistantDialog(QDialog):
                 sb.setValue(sb.maximum())
 
     def _on_model_loaded(self):
-        self.load_btn.setEnabled(True)
+        self._set_model_loading_ui(False)
         self._refresh_model_status()
 
         load_elapsed = (datetime.now() - getattr(self, '_model_load_start_time', datetime.now())).total_seconds()
@@ -1057,19 +1062,6 @@ class AIAssistantDialog(QDialog):
             if current_info.startswith("Loaded:"):
                 self.model_info_label.setText(f"{current_info} ({load_time_text})")
 
-        # Re-enable chat input
-        self.user_input.setEnabled(True)
-        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows...")
-        send_btn = self.findChild(QPushButton, "send_btn")
-        if send_btn:
-            send_btn.setEnabled(True)
-        clear_btn = self.findChild(QPushButton, "clear_btn")
-        if clear_btn:
-            clear_btn.setEnabled(True)
-        copy_btn = self.findChild(QPushButton, "copy_btn")
-        if copy_btn:
-            copy_btn.setEnabled(True)
-
         # Show success message in chat
         desc = self._describe_model_key(self.client.model_name or self.selected_model_key)
         self.chat_display.append(
@@ -1082,22 +1074,8 @@ class AIAssistantDialog(QDialog):
         sb.setValue(sb.maximum())
 
     def _on_model_load_error(self, error):
-        self.load_btn.setEnabled(True)
-        self.status_label.setText(f"Error: {error}")
+        self._set_model_loading_ui(False, f"Error: {error}")
         QMessageBox.warning(self, "Error", f"Failed to load model:\n{error}")
-
-        # Re-enable chat input
-        self.user_input.setEnabled(True)
-        self.user_input.setPlaceholderText("Ask about SQL, data, or workflows...")
-        send_btn = self.findChild(QPushButton, "send_btn")
-        if send_btn:
-            send_btn.setEnabled(True)
-        clear_btn = self.findChild(QPushButton, "clear_btn")
-        if clear_btn:
-            clear_btn.setEnabled(True)
-        copy_btn = self.findChild(QPushButton, "copy_btn")
-        if copy_btn:
-            copy_btn.setEnabled(True)
 
         # Show error message in chat
         self.chat_display.append(
@@ -1705,25 +1683,11 @@ class AIAssistantDialog(QDialog):
         if norm_ref in alias_map:
             return alias_map[norm_ref]
 
-        candidates = []
-        for table_name in self._get_selected_tables_for_ai():
-            norm_table = self._normalize_table_match_text(table_name)
-            if not norm_table:
-                continue
-            if norm_ref in norm_table or norm_table in norm_ref:
-                candidates.append(table_name)
-                continue
-            if "2b" in norm_ref and "2b" in norm_table:
-                candidates.append(table_name)
-                continue
-            if norm_ref.startswith("pr") and norm_table.startswith("pr"):
-                candidates.append(table_name)
-
-        unique = []
-        for candidate in candidates:
-            if candidate not in unique:
-                unique.append(candidate)
-        return unique[0] if len(unique) == 1 else None
+        # Keep generated table repair conservative. Do not use substring or
+        # generic prefix matching here because names like "pr_prep",
+        # "joined_data", or "reconciliation" may be intended CTEs or derived
+        # aliases rather than physical uploaded tables.
+        return None
 
     def _repair_generated_table_refs(self, response: str) -> tuple[str, list]:
         """Replace obvious hallucinated FROM/JOIN table names with selected table names."""
@@ -2108,7 +2072,6 @@ class AIAssistantDialog(QDialog):
             self._stop_generation_status("Generation stopped by user.", "info")
             return
 
-        response, table_repairs = self._repair_generated_table_refs(response)
         elapsed = (datetime.now() - getattr(self, '_response_start_time', datetime.now())).total_seconds()
 
         # 1. Run our DuckDB syntax and binder validation checks
@@ -2150,14 +2113,6 @@ class AIAssistantDialog(QDialog):
                 f"</div>"
             )
 
-        if table_repairs:
-            safe_repairs = ", ".join(table_repairs).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            self.chat_display.append(
-                "<div style='margin:4px 0 6px 0;padding:6px 10px;background:#e3f2fd;"
-                "border-left:3px solid #2196F3;border-radius:4px;color:#0d47a1;font-size:0.9em;'>"
-                f"Table names matched to selected files: {safe_repairs}</div>"
-            )
-        
         sb = self.chat_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 

@@ -128,7 +128,11 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
         self.ai_assistant_dialog = None
         self.shared_ai_client = LocalModelClient()
         self._ai_model_loader = None
+        self.ai_assistant_buttons = []
+        self._ai_preload_in_progress = False
         self.init_ui()
+        if self._get_ai_preload_model_key():
+            self._set_ai_assistant_buttons_enabled(False, "AI model is loading. Please wait.")
         QTimer.singleShot(0, self._preload_ai_model)
 
     def _register_custom_functions(self):
@@ -2997,6 +3001,13 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
 
     def show_ai_assistant(self):
         """Show AI Assistant dialog"""
+        if self._ai_preload_in_progress:
+            QMessageBox.information(
+                self,
+                "AI Model Loading",
+                "The AI model is still loading. The AI Assistant will be enabled once loading is complete."
+            )
+            return
         self._prepare_ai_assistant_dialog()
         
         # Show the dialog (non-modal) so user can interact with main window
@@ -3009,25 +3020,75 @@ class DuckDBQueryEditor(DataOperationDialogs, ViewManager, QueryManager, FileUti
         if self.ai_assistant_dialog is None:
             self.ai_assistant_dialog = AIAssistantDialog(self, shared_client=self.shared_ai_client)
 
+    def register_ai_assistant_button(self, button):
+        """Track AI buttons so they can be enabled only after preload completes."""
+        if button is None:
+            return
+        if button not in self.ai_assistant_buttons:
+            self.ai_assistant_buttons.append(button)
+        if self._ai_preload_in_progress:
+            button.setEnabled(False)
+            button.setToolTip("AI model is loading. Please wait.")
+
+    def _set_ai_assistant_buttons_enabled(self, enabled: bool, tooltip: str | None = None):
+        """Enable or disable all visible AI assistant launch buttons."""
+        for button in list(getattr(self, "ai_assistant_buttons", []) or []):
+            try:
+                button.setEnabled(enabled)
+                if tooltip is not None:
+                    button.setToolTip(tooltip)
+            except RuntimeError:
+                continue
+
+    def _get_ai_preload_model_key(self):
+        """Return the model key that should be preloaded on startup, if any."""
+        try:
+            cfg = self.ai_config if isinstance(getattr(self, "ai_config", None), dict) else {}
+            return cfg.get("default_model") or self.shared_ai_client.get_default_model_key()
+        except Exception:
+            return self.shared_ai_client.get_default_model_key()
+
     def _preload_ai_model(self):
         """Preload the default GGUF model in the background without constructing the AI dialog."""
         if self.shared_ai_client.is_loaded() or getattr(self.shared_ai_client, "_loading", False):
             return
 
-        model_key = None
-        try:
-            cfg = self.ai_config if isinstance(getattr(self, "ai_config", None), dict) else {}
-            model_key = cfg.get("default_model") or self.shared_ai_client.get_default_model_key()
-        except Exception:
-            model_key = self.shared_ai_client.get_default_model_key()
-
+        model_key = self._get_ai_preload_model_key()
         if not model_key:
             return
 
+        self._ai_preload_in_progress = True
+        self._set_ai_assistant_buttons_enabled(False, "AI model is loading. Please wait.")
         self._ai_model_loader = ModelLoaderThread(self.shared_ai_client, model_key)
-        self._ai_model_loader.finished_ok.connect(lambda: logger.info(f"Background AI model ready: {model_key}"))
-        self._ai_model_loader.finished_err.connect(lambda err: logger.warning(f"Background AI model preload failed: {err}"))
+        self._ai_model_loader.finished_ok.connect(lambda: self._on_ai_model_preload_success(model_key))
+        self._ai_model_loader.finished_err.connect(self._on_ai_model_preload_error)
         self._ai_model_loader.start()
+
+    def _on_ai_model_preload_success(self, model_key: str):
+        self._ai_preload_in_progress = False
+        self._set_ai_assistant_buttons_enabled(
+            True,
+            "AI Assistant (SQL-only) - Generate and refine SQL queries from your data",
+        )
+        logger.info(f"Background AI model ready: {model_key}")
+        QMessageBox.information(
+            self,
+            "AI Model Ready",
+            "The AI model finished loading. The AI Assistant is now enabled."
+        )
+
+    def _on_ai_model_preload_error(self, err: str):
+        self._ai_preload_in_progress = False
+        self._set_ai_assistant_buttons_enabled(
+            True,
+            "AI Assistant (SQL-only) - Generate and refine SQL queries from your data",
+        )
+        logger.warning(f"Background AI model preload failed: {err}")
+        QMessageBox.warning(
+            self,
+            "AI Model Load Failed",
+            f"The startup AI preload failed:\n{err}\n\nYou can still open AI Assistant and load a model manually."
+        )
 
 
     def _duckdb_copy_from_parquet(self, src_parquet_path: str, dest_path: str, format: str = 'csv'):

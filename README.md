@@ -1,16 +1,6 @@
-# SimpliSQL - DuckDB SQL Query Editor
+# SimpliSQL V1
 
-A feature-rich, professional SQL query editor powered by **DuckDB** with AI assistance, workflow automation, and advanced data management capabilities.
-
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
-![PyQt6](https://img.shields.io/badge/PyQt6-Latest-green)
-![DuckDB](https://img.shields.io/badge/DuckDB-Latest-orange)
-
-## ✨ Features
-
-# SimpliSQL V2
-
-SimpliSQL V2 is a desktop DuckDB workbench built with PyQt6. It focuses on local file analytics, SQL authoring, workflow-style data operations, export/audit support, and a local AI assistant for DuckDB SQL generation.
+SimpliSQL V1 is a desktop DuckDB workbench built with PyQt6. It focuses on local file analytics, SQL authoring, workflow-style data operations, export/audit support, and a local AI assistant for DuckDB SQL generation.
 
 ## What it does
 
@@ -30,7 +20,6 @@ The AI assistant is local-only in the current V1 implementation.
 - No Ollama dependency
 - No cloud provider dependency
 - Table-aware prompting with selected-table schema, aliases, and sample rows
-- Table-name repair for selected uploaded files
 - Prompt budget management for smaller-context local models
 
 Important notes:
@@ -123,14 +112,14 @@ Python packages are listed in [requirements.txt](c:/Users/Chandana/SimpliSql/.ve
 From the V1 folder:
 
 ```powershell
-cd c:\Users\abcd\SimpliSql\.venv\V1
-c:\Users\abcd\SimpliSql\.venv\Scripts\python.exe Simplisql.py
+cd c:\Users\Chandana\SimpliSql\.venv\V1
+c:\Users\Chandana\SimpliSql\.venv\Scripts\python.exe Simplisql.py
 ```
 
 If you prefer a virtual environment shell first:
 
 ```powershell
-cd c:\Users\abcd\SimpliSql\.venv\V1
+cd c:\Users\Chandana\SimpliSql\.venv\V1
 ..\Scripts\activate
 python Simplisql.py
 ```

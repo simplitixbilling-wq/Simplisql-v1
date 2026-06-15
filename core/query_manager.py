@@ -834,8 +834,9 @@ class QueryManager:
                     print(f"   - {os.path.basename(path)}")
 
             start_time = time.time()
-            print(f"below is the query" + "\n" + query)
-            print(modified_query)
+            print("Original SQL candidate:\n" + query)
+            if modified_query != query:
+                print("Fallback SQL candidate:\n" + modified_query)
             print(f"\n🚀 Query Execution Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             # Show progress dialog for query execution with continuous animation
@@ -859,15 +860,21 @@ class QueryManager:
                 query_result = [None]
                 query_error = [None]
                 query_finished = [False]
+                executed_query = [None]
+                executed_query_label = [None]
                 
                 def execute_query_background():
                     try:
                         # First try the original query
                         query_result[0] = self.conn.execute(query).fetchdf()
+                        executed_query[0] = query
+                        executed_query_label[0] = "original"
                     except Exception as e1:
                         try:
                             # If original fails, try the modified (parquet) query
                             query_result[0] = self.conn.execute(modified_query).fetchdf()
+                            executed_query[0] = modified_query
+                            executed_query_label[0] = "fallback"
                         except Exception as e2:
                             query_error[0] = (e1, e2)
                     finally:
@@ -929,6 +936,8 @@ class QueryManager:
             print(f"✅ Query Execution Completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"⏱️ Total Execution Time: {elapsed_time:.2f} seconds")
             print(f"📊 Result shape: {df.shape}")
+            if executed_query[0]:
+                print(f"🧾 Actual SQL executed ({executed_query_label[0]}):\n{executed_query[0]}")
 
             self.populate_treeview(df)
             self.current_full_df = df

@@ -267,6 +267,8 @@ class UIBuilder:
             ai_btn.setStyleSheet(button_styles + "QPushButton { background-color: #7b1fa2; color: white; padding:4px; width:32px; height:28px; font-size:14px; } QPushButton:pressed { background-color: #6a1b8f; }")
             ai_btn.setText("🤖")
             ai_btn.clicked.connect(self.show_ai_assistant)
+            if hasattr(self, "register_ai_assistant_button"):
+                self.register_ai_assistant_button(ai_btn)
 
             # Dashboard standalone action (icon-like button)
             # Icon-only Dashboard button (compact)
@@ -512,6 +514,8 @@ class UIBuilder:
             ai_assistant_btn.setText("🤖")
             ai_assistant_btn.setStyleSheet(button_styles + "QPushButton { background-color: #7b1fa2; color: white; padding:4px; border-radius:6px; } QPushButton:hover { background-color: #9c27b0; }")
             ai_assistant_btn.clicked.connect(self.show_ai_assistant)
+            if hasattr(self, "register_ai_assistant_button"):
+                self.register_ai_assistant_button(ai_assistant_btn)
             add_header_button_with_separator(ai_assistant_btn)
 
             self.header_icon_buttons = [
