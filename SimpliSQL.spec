@@ -1,17 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+
+SPEC_DIR = Path.cwd().resolve()
+LLAMA_LIB_DIR = (SPEC_DIR.parent / "Lib" / "site-packages" / "llama_cpp" / "lib").resolve()
+
+
+def _llama_binaries():
+    binaries = []
+    for dll_name in ("ggml-base.dll", "ggml-cpu.dll", "ggml.dll", "llama.dll", "mtmd.dll"):
+        dll_path = LLAMA_LIB_DIR / dll_name
+        if dll_path.exists():
+            binaries.append((str(dll_path), "llama_cpp/lib"))
+    return binaries
+
 
 a = Analysis(
     ['Simplisql.py'],
     pathex=['.'],
-    binaries=[
-        # llama_cpp native DLLs – must land in llama_cpp/lib/ inside the bundle
-        ('.venv/Lib/site-packages/llama_cpp/lib/ggml-base.dll', 'llama_cpp/lib'),
-        ('.venv/Lib/site-packages/llama_cpp/lib/ggml-cpu.dll',  'llama_cpp/lib'),
-        ('.venv/Lib/site-packages/llama_cpp/lib/ggml.dll',      'llama_cpp/lib'),
-        ('.venv/Lib/site-packages/llama_cpp/lib/llama.dll',     'llama_cpp/lib'),
-        ('.venv/Lib/site-packages/llama_cpp/lib/mtmd.dll',      'llama_cpp/lib'),
-    ],
+    binaries=_llama_binaries(),
     datas=[
         ('sql.ico', '.'),
         ('sql.png', '.'),
