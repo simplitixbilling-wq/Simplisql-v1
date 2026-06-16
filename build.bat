@@ -1,62 +1,75 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal EnableExtensions
+
+set "SCRIPT_DIR=%~dp0"
+pushd "%SCRIPT_DIR%" >nul
 
 echo ============================================================
-echo  SimpliSQL - Build Script
+echo  SimpliSQL - EXE Build
 echo ============================================================
 echo.
 
-:: ── Locate Python (prefer venv, fall back to system) ────────────────
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
-if not exist "%PYTHON%" (
-    echo [WARN] .venv not found, using system Python
-    set "PYTHON=python"
-)
+set "PYTHON=%SCRIPT_DIR%..\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
 
-:: ── Verify PyInstaller is available ─────────────────────────────────
+echo [1/5] Using Python:
+echo        %PYTHON%
+echo.
+
 "%PYTHON%" -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-    echo [INFO] Installing PyInstaller...
-    "%PYTHON%" -m pip install pyinstaller --quiet
+    echo [INFO] PyInstaller not found. Installing...
+    "%PYTHON%" -m pip install pyinstaller
+    if errorlevel 1 (
+        echo [ERROR] Could not install PyInstaller.
+        goto :fail
+    )
 )
 
-:: ── Clean previous build output ──────────────────────────────────────
-echo [1/4] Cleaning previous build artefacts...
-if exist "%~dp0build"  rmdir /s /q "%~dp0build"
-if exist "%~dp0dist"   rmdir /s /q "%~dp0dist"
-echo       Done.
+set "DIST_DIR=%SCRIPT_DIR%dist_clickbuild"
+set "WORK_DIR=%SCRIPT_DIR%build_clickbuild"
+
+echo [2/5] Cleaning previous click-build folders...
+if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
+if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 echo.
 
-:: ── Remove stale __pycache__ ─────────────────────────────────────────
-echo [2/4] Removing __pycache__ folders...
-for /d /r "%~dp0" %%d in (__pycache__) do (
+echo [3/5] Removing __pycache__ folders...
+for /d /r "%SCRIPT_DIR%" %%d in (__pycache__) do (
     if exist "%%d" rmdir /s /q "%%d"
 )
-echo       Done.
 echo.
 
-:: ── Run PyInstaller ──────────────────────────────────────────────────
-echo [3/4] Building SimpliSQL with PyInstaller...
-echo       Spec file: SimpliSQL.spec
+echo [4/5] Building EXE with PyInstaller...
+echo        Spec file : SimpliSQL.spec
+echo        Dist path : %DIST_DIR%
+echo        Work path : %WORK_DIR%
 echo.
-"%PYTHON%" -m PyInstaller SimpliSQL.spec --noconfirm
+"%PYTHON%" -m PyInstaller SimpliSQL.spec --noconfirm --distpath "%DIST_DIR%" --workpath "%WORK_DIR%"
 if errorlevel 1 (
     echo.
-    echo [ERROR] PyInstaller build failed. Check output above for details.
-    pause
-    exit /b 1
+    echo [ERROR] EXE build failed.
+    goto :fail
 )
-echo.
 
-:: ── Done ─────────────────────────────────────────────────────────────
-echo [4/4] Build complete!
 echo.
-echo  Output folder : dist\SimpliSQL\
-echo  Executable    : dist\SimpliSQL\SimpliSQL.exe
+echo [5/5] Build complete.
 echo.
-echo  NOTE: The 'models' folder is bundled but GGUF files are large.
-echo        If models are missing in dist, copy them manually:
-echo          xcopy /s /y models dist\SimpliSQL\models\
+echo  EXE path:
+echo  %DIST_DIR%\SimpliSQL\SimpliSQL.exe
 echo.
-echo ============================================================
+if exist "%DIST_DIR%\SimpliSQL\SimpliSQL.exe" (
+    start "" explorer "%DIST_DIR%\SimpliSQL"
+)
+
+popd >nul
 pause
+exit /b 0
+
+:fail
+echo.
+echo Build did not finish successfully.
+popd >nul
+pause
+exit /b 1

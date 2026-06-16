@@ -1562,6 +1562,28 @@ class AIAssistantDialog(QDialog):
         aliases.discard(table_name)
         return sorted(aliases, key=lambda x: (len(x), x))[:10]
 
+    def _table_aliases_for_display(self, table_name: str, file_path: str = "") -> list:
+        """Return user-facing aliases without squashed identifier variants."""
+        aliases = []
+        seen = set()
+        for alias in self._table_aliases_for_prompt(table_name, file_path):
+            compact_alias = alias.replace("_", "").replace("-", "").replace(" ", "")
+            normalized_alias = self._normalize_table_match_text(alias)
+            is_squashed = (
+                alias == compact_alias
+                and alias == normalized_alias
+                and any(ch.isdigit() for ch in alias)
+                and len(alias) >= 12
+            )
+            if is_squashed:
+                continue
+            key = alias.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            aliases.append(alias)
+        return aliases
+
     def _selected_table_alias_map(self) -> dict:
         """Return normalized alias -> selected table name for generated SQL repair."""
         editor = self.parent_editor
@@ -2303,9 +2325,11 @@ class AIAssistantDialog(QDialog):
                 if fpath:
                     table_mapping_lines.append(f"  {table_name} -> {fpath.replace(chr(92), '/')}")
 
-                aliases = self._table_aliases_for_prompt(table_name, fpath or "")
+                aliases = self._table_aliases_for_display(table_name, fpath or "")
                 if aliases:
-                    alias_lines.append(f"  {table_name}: {', '.join(aliases)}")
+                    alias_lines.append(
+                        f"  {table_name} <- {', '.join(repr(alias) for alias in aliases)}"
+                    )
 
                 # Sample rows (max 1 per table, compact CSV format)
                 try:
@@ -2328,6 +2352,7 @@ class AIAssistantDialog(QDialog):
             "- ONLY use tables/columns listed below. Never invent names.\n"
             "- If a column name contains spaces, starts with a number, or includes special characters, reference it exactly with double quotes, for example \"2B Document No\".\n"
             "- If the user says PR files, gstr_2b_file, 2B file, or similar wording, match it to the closest selected table filename in TABLE ALIASES. Do not create table names from the user's wording.\n"
+            "- TABLE ALIASES are only for understanding user wording. NEVER use an alias text as a SQL table name. In SQL, ALWAYS use the exact actual table name shown in TABLES.\n"
             "- If a CTE or subquery renames columns with AS, all later references to that CTE/subquery MUST use the renamed output columns, not the original source column names. Example: if a CTE selects \"PR Vendor GSTIN\" AS pr_vendor_gstin, later joins must use cte_alias.pr_vendor_gstin, not cte_alias.\"PR Vendor GSTIN\".\n"
             "- Use DuckDB syntax.\n"
             "- For date/time questions, ALWAYS use DuckDB date/time functions and INTERVAL syntax.\n"
@@ -2363,7 +2388,7 @@ class AIAssistantDialog(QDialog):
             parts.append("TABLE PATHS:\n" + "\n".join(table_mapping_lines))
 
         if alias_lines:
-            parts.append("TABLE ALIASES (user wording -> actual table):\n" + "\n".join(alias_lines))
+            parts.append("TABLE ALIASES (user wording only; do not use these as SQL table names):\n" + "\n".join(alias_lines))
 
         # Sample data (budget-controlled)
         context_limit = self._get_model_context_limit()
